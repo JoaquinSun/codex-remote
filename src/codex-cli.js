@@ -46,13 +46,21 @@ function resolveSandboxMode() {
   return mode;
 }
 
-function queueMessage({ binary, threadId, text, remote, permissionArgs, timeoutMs = 20000 }) {
+function buildQueueArgs({ threadId, text, remote, permissionArgs, model, reasoningEffort }) {
+  const args = ['queue', '--thread', threadId, '--message', text];
+  /* 手机上给这个会话选过权限档位就按它来；没选过就沿用原来的默认。 */
+  if (Array.isArray(permissionArgs) && permissionArgs.length > 0) args.push(...permissionArgs);
+  else args.push('--sandbox', resolveSandboxMode());
+  if (remote) args.push('--remote', remote);
+  if (model) args.push('--model', model);
+  if (reasoningEffort) args.push('--config', 'model_reasoning_effort=' + JSON.stringify(reasoningEffort));
+  return args;
+}
+
+function queueMessage(options) {
+  const { binary, timeoutMs = 20000 } = options;
   return new Promise((resolve, reject) => {
-    const args = ['queue', '--thread', threadId, '--message', text];
-    /* 手机上给这个会话选过权限档位就按它来；没选过就沿用原来的默认。 */
-    if (Array.isArray(permissionArgs) && permissionArgs.length > 0) args.push(...permissionArgs);
-    else args.push('--sandbox', resolveSandboxMode());
-    if (remote) args.push('--remote', remote);
+    const args = buildQueueArgs(options);
 
     let child;
     try {
@@ -101,4 +109,4 @@ function queueMessage({ binary, threadId, text, remote, permissionArgs, timeoutM
   });
 }
 
-module.exports = { resolveCodexBinary, isBusyThreadError, isFreshThreadError, queueMessage };
+module.exports = { resolveCodexBinary, isBusyThreadError, isFreshThreadError, buildQueueArgs, queueMessage };

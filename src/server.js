@@ -24,6 +24,16 @@ const {
   loadPermissionMap,
   savePermissionMap,
 } = require('./permissions');
+const {
+  normalizeSelection,
+  normalizeCatalog,
+  validateSelection,
+  threadParams: modelThreadParams,
+  turnParams: modelTurnParams,
+  effectiveModel,
+  loadModelMap,
+  saveModelMap,
+} = require('./models');
 
 const COOKIE_NAME = 'codex_remote_token';
 /* Give the rollout a moment to flush before handing the writer lock back. */
@@ -43,10 +53,12 @@ const DEFAULT_SOCKET = path.join(
 );
 const DEFAULT_NAME_FILE = path.join(os.homedir(), '.codex-remote', 'name');
 const DEFAULT_PERMISSION_FILE = path.join(os.homedir(), '.codex-remote', 'permissions.json');
+const DEFAULT_MODEL_FILE = path.join(os.homedir(), '.codex-remote', 'models.json');
+const MODEL_CATALOG_TTL_MS = 60000;
 /* turn/steer 的 expectedTurnId 对不上（这一轮刚好跑完、或者已经换轮了）时的报错都长这样；
    这些情况下引导没意义，退回正常发送即可。 */
 const STEER_MISS_PATTERN = /expectedturnid|expected turn|no active turn|not active|turn not found|already (?:finished|completed)/i;
-const BRIDGE_VERSION = '1.9.3';
+const BRIDGE_VERSION = '1.10.1';
 /* 延时探测别被 Codex 的忙闲拖住：HTTP 最多等 350ms，超了先用上一次采样；
    采样 1.5 秒内算新鲜，不必重复问 daemon。 */
 const DAEMON_PROBE_DEADLINE_MS = 350;
@@ -289,6 +301,7 @@ function parseArguments(argv) {
     name: process.env.CODEX_REMOTE_NAME || '',
     nameFile: DEFAULT_NAME_FILE,
     permissionFile: DEFAULT_PERMISSION_FILE,
+    modelFile: DEFAULT_MODEL_FILE,
   };
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -314,6 +327,9 @@ function parseArguments(argv) {
       index += 1;
     } else if (argument === '--permission-file' && next) {
       options.permissionFile = next;
+      index += 1;
+    } else if (argument === '--model-file' && next) {
+      options.modelFile = next;
       index += 1;
     }
   }
@@ -486,6 +502,9 @@ class Bridge {
     this.ephemeralThreads = new Map();
     /* 每个会话的权限档位（用户显式设置过的才在这里），存在 ~/.codex-remote/permissions.json */
     this.permissions = loadPermissionMap(options.permissionFile);
+    this.models = loadModelMap(options.modelFile);
+    this.modelCatalog = null;
+    this.modelCatalogPromise = null;
     /* daemon 报回来的「实际生效」设置，用来在电脑上改过之后仍然显示真实状态 */
     this.threadSettings = new Map();
     this.reconnectTimer = null;
@@ -585,6 +604,8 @@ class Bridge {
   _connectToAppServer() {
     const connection = new AppServerConnection(this.options.socketPath);
     this.connection = connection;
+    this.modelCatalog = null;
+    this.modelCatalogPromise = null;
 
     connection.on('notification', (message) => this._handleNotification(message));
     connection.on('serverRequest', (message) => this._handleServerRequest(message));
@@ -722,6 +743,7 @@ class Bridge {
         threadId: params.threadId,
         permission: this._permissionView(params.threadId),
       });
+      this._broadcast({ type: 'model', threadId: params.threadId, modelSelection: this._modelView(params.threadId) });
     }
 
     this._broadcast({
@@ -941,16 +963,85 @@ class Bridge {
      thread/settings/updated 通知里都有，攒起来给手机显示真实状态。 */
   _recordThreadSettings(threadId, settings) {
     if (!threadId || !settings) return;
-    const merged = Object.assign({}, this.threadSettings.get(threadId), settings);
+    const source = settings.threadSettings || settings;
+    const merged = Object.assign({}, this.threadSettings.get(threadId));
+    /* A legacy thread/read can contain megabytes of turns. Cache only the
+       settings used by the composer, never the full response or history. */
+    for (const key of ['approvalPolicy', 'approvalsReviewer', 'sandbox', 'sandboxPolicy', 'modelProvider', 'effort', 'reasoningEffort']) {
+      if (Object.hasOwn(source, key)) merged[key] = source[key];
+    }
+    const model = effectiveModel(source, settings.thread);
+    if (model) {
+      merged.model = model.model;
+      merged.effort = model.reasoningEffort;
+    }
     this.threadSettings.set(threadId, merged);
+  }
+
+  async _listModels(refresh = false) {
+    const connection = this._requireConnection();
+    if (!refresh && this.modelCatalog && Date.now() - this.modelCatalog.at < MODEL_CATALOG_TTL_MS) {
+      return this.modelCatalog.data;
+    }
+    if (this.modelCatalogPromise) return this.modelCatalogPromise;
+    const pending = (async () => {
+      const entries = [];
+      const cursors = new Set();
+      let cursor = null;
+      do {
+        const result = await connection.request('model/list', Object.assign(
+          { limit: 100, includeHidden: false }, cursor ? { cursor } : {}
+        ), { timeoutMs: 10000 });
+        if (Array.isArray(result.data)) entries.push(...result.data);
+        cursor = result.nextCursor || null;
+        if (cursor && cursors.has(cursor)) throw new Error('model/list returned a repeated cursor');
+        if (cursor) cursors.add(cursor);
+      } while (cursor);
+      const data = normalizeCatalog(entries);
+      if (this.connection === connection) this.modelCatalog = { at: Date.now(), data };
+      return data;
+    })();
+    this.modelCatalogPromise = pending;
+    try {
+      return await pending;
+    } finally {
+      if (this.modelCatalogPromise === pending) this.modelCatalogPromise = null;
+    }
+  }
+
+  async _validateModelSelection(value) {
+    const selection = normalizeSelection(value);
+    if (!selection.model) return selection;
+    return validateSelection(selection, await this._listModels());
+  }
+
+  _modelView(threadId, thread) {
+    return Object.assign({ model: null, reasoningEffort: null }, this.models[threadId], {
+      effective: effectiveModel(this.threadSettings.get(threadId), thread),
+    });
+  }
+
+  _setModel(threadId, selection) {
+    const next = Object.assign(Object.create(null), this.models);
+    if (selection.model) next[threadId] = selection;
+    else delete next[threadId];
+    if (!this.ephemeralThreads.has(threadId)) {
+      const persisted = Object.fromEntries(Object.entries(next).filter(([id]) => !this.ephemeralThreads.has(id)));
+      saveModelMap(this.options.modelFile, persisted);
+    }
+    this.models = next;
+    const modelSelection = this._modelView(threadId);
+    this._broadcast({ type: 'model', threadId, modelSelection });
+    return modelSelection;
   }
 
   _permissionView(threadId) {
     const mode = this.permissions[threadId] || 'default';
     const settings = this.threadSettings.get(threadId) || null;
+    const hasPermissions = settings && (settings.approvalPolicy != null || settings.sandbox != null || settings.sandboxPolicy != null);
     return {
       mode,
-      effective: settings
+      effective: hasPermissions
         ? {
             approvalPolicy: settings.approvalPolicy || null,
             sandbox: sandboxLabel(settings.sandbox || settings.sandboxPolicy),
@@ -995,6 +1086,7 @@ class Bridge {
   async _readThread(threadId) {
     try {
       const result = await this.connection.request('thread/read', { threadId, includeTurns: true });
+      this._recordThreadSettings(threadId, result);
       this._reconcileActiveTurn(threadId, result && result.thread && result.thread.turns);
       return result;
     } catch (error) {
@@ -1005,6 +1097,7 @@ class Bridge {
          日志补回（见 GET /api/threads/:id）。 */
       if (!/not supported/i.test(message) && !/do not support/i.test(message)) throw error;
       const bare = await this.connection.request('thread/read', { threadId });
+      this._recordThreadSettings(threadId, bare);
       return Object.assign({}, bare, {
         thread: Object.assign({}, bare && bare.thread, {
           turns: (bare && bare.thread && bare.thread.turns) || [],
@@ -1019,6 +1112,7 @@ class Bridge {
   async _readThreadWindow(threadId, turnLimit) {
     try {
       const meta = await this.connection.request('thread/read', { threadId });
+      this._recordThreadSettings(threadId, meta);
       const list = await this.connection.request('thread/turns/list', {
         threadId,
         limit: turnLimit,
@@ -1088,6 +1182,7 @@ class Bridge {
             name: this.bridgeName,
             hostname: os.hostname(),
             host: os.hostname().replace(/\.local$/i, ''),
+            listenHost: this.options.host,
             platform: process.platform,
             version: BRIDGE_VERSION,
             startedAt: this.startedAt,
@@ -1243,12 +1338,27 @@ class Bridge {
         return;
       }
 
+      if (segments[1] === 'models' && segments.length === 2 && request.method === 'GET') {
+        sendJson(response, 200, { data: await this._listModels(url.searchParams.get('refresh') === '1') });
+        return;
+      }
+
+      if (segments[1] === 'threads' && segments.length === 4 && segments[3] === 'model' && request.method === 'POST') {
+        const body = await readJsonBody(request, 8 * 1024);
+        const selection = await this._validateModelSelection(body);
+        /* Save a next-turn choice without resuming or taking the desktop's writer lock. */
+        const modelSelection = this._setModel(segments[2], selection);
+        sendJson(response, 200, { ok: true, modelSelection });
+        return;
+      }
+
       const connection = this._requireConnection();
 
       if (segments[1] === 'new-thread' && request.method === 'POST') {
         const body = await readJsonBody(request);
         const name = typeof body.name === 'string' ? body.name.trim().slice(0, 120) : '';
         const mode = normalizeMode(body.permission);
+        const selection = await this._validateModelSelection({ model: body.model, reasoningEffort: body.reasoningEffort });
         /* 临时对话 = daemon 的 ephemeral 会话：不落盘、不进历史，关掉就没了 */
         const ephemeral = body.ephemeral === true;
         const requested = expandUserPath(body.cwd);
@@ -1266,7 +1376,7 @@ class Bridge {
         }
         const created = await connection.request(
           'thread/start',
-          Object.assign({ cwd }, ephemeral ? { ephemeral: true } : {}, permissionThreadParams(mode))
+          Object.assign({ cwd }, ephemeral ? { ephemeral: true } : {}, permissionThreadParams(mode), modelThreadParams(selection))
         );
         const threadId = created?.thread?.id;
         this._markThreadLoaded(threadId);
@@ -1278,6 +1388,7 @@ class Bridge {
         if (ephemeral) this._rememberEphemeral(threadId, { cwd, name });
         if (mode !== 'default') this._setPermission(threadId, mode);
         this._recordThreadSettings(threadId, created);
+        if (selection.model) this._setModel(threadId, selection);
         if (name) {
           try {
             await connection.request('thread/name/set', { threadId, name });
@@ -1364,6 +1475,8 @@ class Bridge {
         const threadId = String(body.threadId || '');
         this.ephemeralThreads.delete(threadId);
         this.activeTurns.delete(threadId);
+        delete this.models[threadId];
+        this.threadSettings.delete(threadId);
         try {
           await connection.request('thread/unsubscribe', { threadId });
         } catch (error) {
@@ -1418,6 +1531,7 @@ class Bridge {
           running,
           turnId: running ? activeTurnId : null,
           attached: this.loadedThreads.has(threadId),
+          modelSelection: this._modelView(threadId),
           error: liveError,
         });
         return;
@@ -1453,6 +1567,7 @@ class Bridge {
         }
         const payload = Object.assign({}, trimmedResult, {
           permission: this._permissionView(threadId),
+          modelSelection: this._modelView(threadId, trimmedResult.thread),
           attached: this.loadedThreads.has(threadId),
           activeTurnId: this.activeTurns.get(threadId) || null,
           running: Boolean(this.activeTurns.get(threadId)),
@@ -1637,6 +1752,7 @@ class Bridge {
     const connection = this._requireConnection();
     const images = Array.isArray(imagePaths) ? imagePaths : [];
     const mode = this.permissions[threadId] || 'default';
+    const selection = this.models[threadId] || null;
     const input = [];
     if (text) input.push({ type: 'text', text });
     for (const imagePath of images) input.push({ type: 'localImage', path: imagePath });
@@ -1703,14 +1819,14 @@ class Bridge {
     const ephemeral = this.ephemeralThreads.has(threadId);
     const resumeError = ephemeral
       ? null
-      : await this._resumeThread(threadId, permissionThreadParams(mode));
+      : await this._resumeThread(threadId, Object.assign({}, permissionThreadParams(mode), modelThreadParams(selection)));
     let busyError = resumeError && !isFreshThreadError(resumeError) ? resumeError : null;
 
     if (!busyError) {
       try {
         const result = await connection.request(
           'turn/start',
-          Object.assign({ threadId, input }, permissionTurnParams(mode))
+          Object.assign({ threadId, input }, permissionTurnParams(mode), modelTurnParams(selection))
         );
         if (result?.turn?.id) this.activeTurns.set(threadId, result.turn.id);
         return { mode: 'started', turn: result?.turn ?? null, images: images.length };
@@ -1741,6 +1857,8 @@ class Bridge {
         text,
         remote: this.remoteTarget,
         permissionArgs: permissionQueueArgs(mode),
+        model: selection && selection.model,
+        reasoningEffort: selection && selection.reasoningEffort,
       });
       return { mode: 'queued', queueId: queued.queueId, reason: busyError.message };
     } catch (error) {

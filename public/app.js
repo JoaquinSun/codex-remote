@@ -48,6 +48,13 @@ const state = {
   permissionProfiles: [],
   threadModes: {},
   permission: null,
+  models: [],
+  modelsLoading: false,
+  modelsError: '',
+  modelSaving: false,
+  modelSelection: null,
+  activityGroups: new Map(),
+  activityItems: new Map(),
   theme: 'auto',
   /* 首屏先要最近的 300 条，滚到顶部再自动续载，长会话打开更快。 */
   itemLimit: 300,
@@ -57,6 +64,7 @@ const state = {
   runStarted: null,
   projects: [],
   collapsedGroups: [],
+  threadQuery: '',
   foldingEvents: false,
 };
 
@@ -67,6 +75,7 @@ const dom = {
   sidebarCollapse: document.getElementById('sidebar-collapse'),
   sidebarClose: document.getElementById('sidebar-close'),
   sidebarRefresh: document.getElementById('sidebar-refresh'),
+  sidebarSearchInput: document.getElementById('sidebar-search-input'),
   scrim: document.getElementById('scrim'),
   refreshButton: document.getElementById('refresh-button'),
   themeButton: document.getElementById('theme-button'),
@@ -90,6 +99,8 @@ const dom = {
   newChatHeading: document.getElementById('new-chat-heading'),
   newChatProject: document.getElementById('new-chat-project'),
   newChatPermission: document.getElementById('new-chat-permission'),
+  newChatModel: document.getElementById('new-chat-model'),
+  newChatEffort: document.getElementById('new-chat-effort'),
   newChatCancel: document.getElementById('new-chat-cancel'),
   newChatCreate: document.getElementById('new-chat-create'),
   renameButton: document.getElementById('rename-button'),
@@ -121,6 +132,16 @@ const dom = {
   permissionPanel: document.getElementById('permission-panel'),
   permissionOptions: document.getElementById('permission-options'),
   permissionEffective: document.getElementById('permission-effective'),
+  modelButton: document.getElementById('model-button'),
+  modelText: document.getElementById('model-text'),
+  modelPanel: document.getElementById('model-panel'),
+  modelEffective: document.getElementById('model-effective'),
+  modelSelect: document.getElementById('model-select'),
+  modelEffort: document.getElementById('model-effort'),
+  modelDescription: document.getElementById('model-description'),
+  modelError: document.getElementById('model-error'),
+  modelRetry: document.getElementById('model-retry'),
+  modelApply: document.getElementById('model-apply'),
   approvalSlot: document.getElementById('approval-slot'),
   messageInput: document.getElementById('message-input'),
   attachButton: document.getElementById('attach-button'),
@@ -619,6 +640,17 @@ function scheduleDeltaFlush(item) {
 }
 
 function flushItemDelta(item) {
+  item = findItem(item.id).item || item;
+  const activityId = state.activityItems.get(item.id);
+  if (activityId) {
+    const details = dom.turns.querySelector('[data-activity-id="' + CSS.escape(activityId) + '"]');
+    const group = state.activityGroups.get(activityId);
+    if (details && group) {
+      details.querySelector('summary').innerHTML = renderActivitySummary(group);
+      /* Folded execution history keeps accumulating data without building tool DOM. */
+      if (!details.open) return;
+    }
+  }
   const root = dom.turns.querySelector('[data-item-id="' + CSS.escape(item.id || '') + '"]');
   /* 这个 item 还没画出来（比如序号对不上、刚切了会话），退回整块重画最稳 */
   if (!root) {
@@ -858,6 +890,7 @@ function handleEvent(event) {
     );
     state.activeTurns = event.activeTurns || {};
     updateStatusLine();
+    if (state.connected && !state.models.length) loadModels();
     renderApprovals();
     if (state.currentThreadId) renderThread();
     return;
@@ -868,6 +901,7 @@ function handleEvent(event) {
     state.connectionError = event.error || null;
     if (event.userAgent) state.userAgent = event.userAgent;
     updateStatusLine();
+    if (state.connected) loadModels(true);
     return;
   }
 
@@ -893,6 +927,15 @@ function handleEvent(event) {
       renderPermission();
     }
     renderList();
+    return;
+  }
+
+  if (event.type === 'model' && event.modelSelection) {
+    if (event.threadId === state.currentThreadId) {
+      state.modelSelection = event.modelSelection;
+      renderModel();
+      renderThreadMeta();
+    }
     return;
   }
 
@@ -1190,6 +1233,8 @@ function toggleLatencyPanel(show) {
   /* 节奏跟面板状态走：开着 2 秒一拍，收起恢复 5 秒 */
   scheduleLatency();
   if (!next) return;
+  togglePermissionPanel(false);
+  toggleModelPanel(false);
   anchorLatencyPanel();
   measureLatency();
 }
@@ -1215,12 +1260,11 @@ function applyTheme() {
   document.documentElement.dataset.theme = dark ? 'dark' : 'light';
   document.documentElement.dataset.themeMode = mode;
   const meta = document.querySelector('meta[name="theme-color"]');
-  if (meta) meta.setAttribute('content', dark ? '#111111' : '#ffffff');
+  if (meta) meta.setAttribute('content', dark ? '#0f0f0f' : '#fbfbfa');
   /* 加到主屏当 App 用时，iOS 状态栏字色要靠这个 meta 切 */
   const statusBar = document.querySelector('meta[name="apple-mobile-web-app-status-bar-style"]');
   if (statusBar) statusBar.setAttribute('content', dark ? 'black-translucent' : 'default');
   if (!dom.themeButton) return;
-  dom.themeButton.textContent = THEME_ICONS[mode];
   dom.themeButton.dataset.mode = mode;
   const title = '外观：' + THEME_LABELS[mode] + (mode === 'auto' ? '（现在' + (dark ? '夜间' : '白天') + '）' : '');
   dom.themeButton.title = title;
@@ -1324,7 +1368,159 @@ function togglePermissionPanel(show) {
   const next = show === undefined ? dom.permissionPanel.hidden : show;
   dom.permissionPanel.hidden = !next;
   dom.permissionButton.setAttribute('aria-expanded', next ? 'true' : 'false');
-  if (next) renderPermissionOptions();
+  if (next) {
+    toggleModelPanel(false);
+    toggleLatencyPanel(false);
+    renderPermissionOptions();
+  }
+}
+
+/* Model names and effort choices come from the connected Codex catalog. */
+const EFFORT_LABELS = {
+  none: '无', minimal: '最少', low: '低', medium: '中', high: '高',
+  xhigh: '很高', max: '最高', ultra: '超高',
+};
+
+function modelEntry(model) {
+  return state.models.find((entry) => entry.model === model || entry.id === model) || null;
+}
+
+function modelLabel(model) {
+  const entry = modelEntry(model);
+  return entry ? entry.displayName : model || '跟随电脑';
+}
+
+function renderModel() {
+  const selection = state.modelSelection || {};
+  const effective = selection.effective || (
+    state.thread && state.thread.id === state.currentThreadId && state.thread.model
+      ? { model: state.thread.model, reasoningEffort: state.thread.reasoningEffort } : null
+  );
+  const nextModel = selection.model || (effective && effective.model);
+  dom.modelText.textContent = modelLabel(nextModel);
+  dom.modelButton.classList.toggle('custom', Boolean(selection.model));
+  const effort = selection.reasoningEffort || (effective && effective.reasoningEffort);
+  dom.modelButton.title = '下一轮模型：' + modelLabel(nextModel) +
+    (effort ? ' · 思考强度 ' + (EFFORT_LABELS[effort] || effort) : '') +
+    (selection.model ? '' : '（跟随电脑）');
+  dom.modelEffective.textContent = effective ? '当前：' + modelLabel(effective.model) : '等待会话信息';
+  dom.modelEffective.title = effective && effective.reasoningEffort
+    ? '当前思考强度：' + (EFFORT_LABELS[effective.reasoningEffort] || effective.reasoningEffort) : '';
+}
+
+function renderThreadMeta() {
+  const effective = state.modelSelection && state.modelSelection.effective;
+  dom.threadMeta.textContent = state.thread
+    ? [state.thread.cwd, (effective && effective.model) || state.thread.model].filter(Boolean).join(' · ') : '';
+}
+
+function renderModelChoices(select, value) {
+  const model = value === undefined ? select.value : value || '';
+  const choices = ['<option value="">跟随电脑</option>'];
+  if (model && !modelEntry(model)) choices.push('<option value="' + escapeHtml(model) + '">' + escapeHtml(model) + '（当前设置）</option>');
+  for (const entry of state.models) {
+    choices.push('<option value="' + escapeHtml(entry.model) + '">' + escapeHtml(entry.displayName) +
+      (entry.isDefault ? ' · 推荐' : '') + '</option>');
+  }
+  select.innerHTML = choices.join('');
+  select.value = model;
+}
+
+function renderEffortChoices(modelSelect, effortSelect, preferred) {
+  const entry = modelEntry(modelSelect.value);
+  const options = entry ? entry.supportedReasoningEfforts || [] : [];
+  const previous = preferred === undefined ? effortSelect.value : preferred;
+  if (!options.length) {
+    effortSelect.innerHTML = '<option value="">' + (modelSelect.value ? '模型默认' : '跟随电脑') + '</option>';
+    effortSelect.disabled = true;
+    return;
+  }
+  effortSelect.disabled = false;
+  effortSelect.innerHTML = options.map((option) => '<option value="' + escapeHtml(option.reasoningEffort) +
+    '" title="' + escapeHtml(option.description || '') + '">' +
+    escapeHtml(EFFORT_LABELS[option.reasoningEffort] || option.reasoningEffort) +
+    (option.reasoningEffort === entry.defaultReasoningEffort ? '（默认）' : '') + '</option>').join('');
+  const supported = options.some((option) => option.reasoningEffort === previous);
+  effortSelect.value = supported ? previous : entry.defaultReasoningEffort || options[0].reasoningEffort;
+  if (!effortSelect.value) effortSelect.value = options[0].reasoningEffort;
+}
+
+function renderModelDraft() {
+  renderEffortChoices(dom.modelSelect, dom.modelEffort);
+  const entry = modelEntry(dom.modelSelect.value);
+  dom.modelDescription.textContent = entry ? entry.description || '' : '沿用电脑上这个会话的模型设置。';
+  dom.modelDescription.hidden = !dom.modelDescription.textContent;
+}
+
+function renderModelLoading() {
+  dom.modelError.textContent = state.modelsLoading ? '正在加载模型…' : state.modelsError;
+  dom.modelError.hidden = !state.modelsLoading && !state.modelsError;
+  dom.modelRetry.hidden = !state.modelsError || state.modelsLoading;
+  dom.modelApply.disabled = state.modelsLoading || state.modelSaving;
+}
+
+async function loadModels(refresh = false) {
+  if (state.modelsLoading) return;
+  state.modelsLoading = true;
+  state.modelsError = '';
+  renderModelLoading();
+  try {
+    const result = await api('/api/models' + (refresh ? '?refresh=1' : ''));
+    state.models = Array.isArray(result.data) ? result.data : [];
+    renderModelChoices(dom.modelSelect, dom.modelPanel.hidden
+      ? (state.modelSelection && state.modelSelection.model) || '' : undefined);
+    renderModelChoices(dom.newChatModel);
+    renderModelDraft();
+    renderEffortChoices(dom.newChatModel, dom.newChatEffort);
+    renderModel();
+  } catch (error) {
+    state.modelsError = '模型列表加载失败：' + error.message;
+  } finally {
+    state.modelsLoading = false;
+    renderModelLoading();
+  }
+}
+
+function toggleModelPanel(show) {
+  const next = show === undefined ? dom.modelPanel.hidden : show;
+  dom.modelPanel.hidden = !next;
+  dom.modelButton.setAttribute('aria-expanded', next ? 'true' : 'false');
+  if (!next) return;
+  togglePermissionPanel(false);
+  toggleLatencyPanel(false);
+  const selection = state.modelSelection || {};
+  renderModelChoices(dom.modelSelect, selection.model || '');
+  renderEffortChoices(dom.modelSelect, dom.modelEffort, selection.reasoningEffort);
+  renderModelDraft();
+  renderModelLoading();
+  if (!state.models.length && !state.modelsLoading) loadModels();
+  dom.modelSelect.focus();
+}
+
+async function applyModelSelection() {
+  const threadId = state.currentThreadId;
+  if (!threadId || state.modelSaving) return;
+  const model = dom.modelSelect.value || null;
+  const reasoningEffort = model ? dom.modelEffort.value || null : null;
+  state.modelSaving = true;
+  renderModelLoading();
+  try {
+    const result = await api('/api/threads/' + encodeURIComponent(threadId) + '/model', {
+      method: 'POST', body: JSON.stringify({ model, reasoningEffort }),
+    });
+    if (state.currentThreadId !== threadId) return;
+    state.modelSelection = result.modelSelection;
+    renderModel();
+    toggleModelPanel(false);
+    toast(model ? '下一轮使用 ' + modelLabel(model) : '模型已设为跟随电脑');
+  } catch (error) {
+    if (state.currentThreadId === threadId) {
+      state.modelsError = '模型设置失败：' + error.message;
+    }
+  } finally {
+    state.modelSaving = false;
+    renderModelLoading();
+  }
 }
 
 async function loadPermissions() {
@@ -1517,7 +1713,7 @@ function appendGroup(group) {
       const add = document.createElement('button');
       add.type = 'button';
       add.className = 'group-add';
-      add.textContent = '＋';
+      add.innerHTML = '<svg class="icon" aria-hidden="true"><use href="#i-plus"></use></svg>';
       add.title = '在「' + group.label + '」下新建对话';
       add.setAttribute('aria-label', add.title);
       add.addEventListener('click', (event) => {
@@ -1543,9 +1739,33 @@ function appendGroup(group) {
 
 function renderList() {
   dom.threadList.innerHTML = '';
-  dom.listEmpty.hidden = state.threads.length > 0;
 
   renderCwdOptions();
+
+  const query = state.threadQuery.trim().toLowerCase();
+  if (query) {
+    const hits = sortThreads(
+      state.threads.filter((thread) =>
+        [thread.name, thread.preview].some((value) =>
+          String(value || '').toLowerCase().includes(query)
+        )
+      )
+    );
+    dom.listEmpty.hidden = hits.length > 0;
+    dom.listEmpty.textContent = hits.length ? '' : '没有匹配的会话';
+    if (hits.length) {
+      const summary = document.createElement('li');
+      summary.className = 'search-summary';
+      summary.textContent = hits.length + ' 个结果';
+      dom.threadList.appendChild(summary);
+      for (const thread of hits) dom.threadList.appendChild(threadCard(thread, {}));
+    }
+    updateStatusLine();
+    return;
+  }
+
+  dom.listEmpty.hidden = state.threads.length > 0;
+  dom.listEmpty.textContent = state.threads.length ? '' : '还没有会话';
 
   const ephemeral = sortThreads(state.threads.filter((thread) => thread.ephemeral));
   const rest = state.threads.filter((thread) => !thread.ephemeral);
@@ -1690,6 +1910,11 @@ function renderItem(item) {
     );
   }
 
+  if (item.type === 'exitedReviewMode') {
+    return '<div class="item item-agent" data-item-id="' + id + '"><div class="md">' +
+      renderMarkdown(item.review || '', currentCwd()) + '</div></div>';
+  }
+
   if (item.type === 'reasoning') {
     const reasoning = reasoningText(item);
     if (!reasoning.text) return '';
@@ -1740,7 +1965,7 @@ function renderItem(item) {
     return '<div class="item item-plan" data-item-id="' + id + '">' + renderMarkdown(item.text, currentCwd()) + '</div>';
   }
 
-  if (item.type === 'webSearch' || item.type === 'mcpToolCall' || item.type === 'dynamicToolCall') {
+  if (item.type === 'webSearch' || item.type === 'mcpToolCall' || item.type === 'dynamicToolCall' || item.type === 'collabToolCall') {
     const label = item.type === 'webSearch' ? '联网搜索' : '工具调用';
     return (
       '<details class="block" data-item-id="' + id + '">' +
@@ -1749,7 +1974,41 @@ function renderItem(item) {
     );
   }
 
-  return '';
+  return '<details class="block" data-item-id="' + id + '"><summary>其他活动</summary><div class="body">' +
+    escapeHtml(clipForDisplay(JSON.stringify(item, null, 1), OUTPUT_RENDER_LIMIT)) + '</div></details>';
+}
+
+function renderActivitySummary(group) {
+  const summary = CodexChatView.activitySummary(group.items, { running: group.running, status: group.status });
+  return '<span class="activity-icon' + (summary.failed ? ' failed' : '') + (summary.running ? ' active' : '') +
+    '" aria-hidden="true">' + summary.icon + '</span><span class="activity-summary-text">' +
+    '<span class="activity-title">' + escapeHtml(summary.label) + '</span>' +
+    '<span class="activity-counts">' + escapeHtml(summary.counts) + '</span>' +
+    (summary.preview ? '<span class="activity-preview">' + escapeHtml(summary.preview) + '</span>' : '') +
+    '</span><span class="activity-chevron" aria-hidden="true">›</span>';
+}
+
+function renderActivityBody(group) {
+  return group.items.map(renderItem).join('') + (group.includePlan ? renderPlan(group.turnId) : '');
+}
+
+function renderActivity(turn, group, running, includePlan, openDetails) {
+  const id = 'activity-' + turn.id + '-' + group.key;
+  const descriptor = { items: group.items, turnId: turn.id, status: turn.status, running, includePlan };
+  state.activityGroups.set(id, descriptor);
+  for (const item of group.items) if (item.id) state.activityItems.set(item.id, id);
+  const open = openDetails.has(id);
+  return '<details class="activity" data-item-id="' + escapeHtml(id) + '" data-activity-id="' + escapeHtml(id) +
+    '"' + (open ? ' open data-hydrated="true"' : '') + '><summary>' + renderActivitySummary(descriptor) +
+    '</summary><div class="activity-body">' + (open ? renderActivityBody(descriptor) : '') + '</div></details>';
+}
+
+function hydrateActivity(details) {
+  if (!details.open || details.dataset.hydrated === 'true') return;
+  const group = state.activityGroups.get(details.dataset.activityId);
+  if (!group) return;
+  details.querySelector('.activity-body').innerHTML = renderActivityBody(group);
+  details.dataset.hydrated = 'true';
 }
 
 function renderPlan(turnId) {
@@ -1791,7 +2050,11 @@ function applyBridgeMeta() {
     '点这里给这台电脑起名字' +
     (meta.hostname ? '（' + meta.hostname + (meta.version ? ' · v' + meta.version : '') + '）' : '');
   if (state.currentThreadId) renderHeaderSubtitle();
-  else dom.subtitle.textContent = '';
+  else {
+    dom.subtitle.textContent = '';
+    /* 首屏空状态里也写着电脑名字，meta 回来之后补一次 */
+    if (state.turns.length === 0 && !state.threadChecking) renderPlaceholder();
+  }
 }
 
 async function loadBridgeMeta() {
@@ -1888,9 +2151,24 @@ function renderPlaceholder() {
   dom.subtitle.textContent = '';
   dom.subtitle.className = '';
   dom.threadMeta.textContent = '';
+  const bridge = state.bridgeName ? escapeHtml(state.bridgeName) : '这台电脑';
   dom.turns.innerHTML =
-    '<div id="placeholder">' +
-    (isNarrow() ? '点左上角 ☰ 选择或开始一个会话' : '从左侧选择一个会话，或新建任务') +
+    '<div id="placeholder" class="empty-state">' +
+    '<div class="empty-logo" aria-hidden="true"><svg class="icon" viewBox="0 0 32 32"><use href="#i-logo"></use></svg></div>' +
+    '<h1>准备好继续了吗？</h1>' +
+    '<p class="empty-copy">' +
+    (isNarrow()
+      ? '从左上角打开会话列表，接着电脑上的 Codex 继续干活。'
+      : '在左侧选一个电脑上的会话接着聊，或者开一个新的任务。') +
+    '</p>' +
+    '<div class="empty-actions">' +
+    '<button type="button" class="btn btn-primary" data-empty-action="new">' +
+    '<svg class="icon" aria-hidden="true"><use href="#i-plus"></use></svg>新建对话</button>' +
+    '<button type="button" class="btn" data-empty-action="ephemeral">' +
+    '<svg class="icon" aria-hidden="true"><use href="#i-sparkle"></use></svg>临时对话</button>' +
+    '</div>' +
+    '<p class="empty-foot"><span class="empty-dot"></span>连接到 ' + bridge +
+    ' · 会话会实时同步</p>' +
     '</div>';
 }
 
@@ -2056,6 +2334,12 @@ async function loadEarlierItems() {
 function renderThread() {
   if (!state.currentThreadId) return;
 
+  const openDetails = new Set(
+    [...dom.turns.querySelectorAll('details[open][data-item-id]')].map((el) => el.getAttribute('data-item-id'))
+  );
+  state.activityGroups = new Map();
+  state.activityItems = new Map();
+
   const active = threadRunning();
   renderComposerButtons(active);
   renderPending();
@@ -2099,14 +2383,16 @@ function renderThread() {
     const items = turn.items || [];
     const byItem = anchored.get(turn.id);
     const body = [];
+    const streamItems = [];
+    const appendEcho = (echo) => streamItems.push({ type: 'localEcho', echo });
     if (byItem && items.length === 0) {
-      for (const echo of byItem.get('') || []) body.push(renderEcho(echo));
+      for (const echo of byItem.get('') || []) appendEcho(echo);
     }
     const placed = new Set();
     for (const item of items) {
-      body.push(renderItem(item));
+      streamItems.push(item);
       if (byItem && byItem.has(item.id)) {
-        for (const echo of byItem.get(item.id)) body.push(renderEcho(echo));
+        for (const echo of byItem.get(item.id)) appendEcho(echo);
         placed.add(item.id);
       }
     }
@@ -2115,8 +2401,23 @@ function renderThread() {
       for (const [itemId, list] of byItem) {
         if (itemId && placed.has(itemId)) continue;
         if (!itemId && items.length === 0) continue;
-        for (const echo of list) body.push(renderEcho(echo));
+        for (const echo of list) appendEcho(echo);
       }
+    }
+    const groups = CodexChatView.groupTurnItems(streamItems);
+    const hasPlan = Boolean((state.planSteps.get(turn.id) || []).length);
+    let lastActivity = groups.reduce((last, group, index) => group.type === 'activity' ? index : last, -1);
+    if (hasPlan && lastActivity === -1) {
+      const firstAnswer = groups.findIndex((group) => group.type === 'message' &&
+        group.item.type !== 'userMessage' && group.item.type !== 'localEcho');
+      lastActivity = firstAnswer === -1 ? groups.length : firstAnswer;
+      groups.splice(lastActivity, 0, { type: 'activity', key: 'plan', items: [] });
+    }
+    for (let index = 0; index < groups.length; index += 1) {
+      const group = groups[index];
+      if (group.type === 'message') body.push(group.item.type === 'localEcho' ? renderEcho(group.item.echo) : renderItem(group.item));
+      else body.push(renderActivity(turn, group, turn.status === 'inProgress' && index === lastActivity,
+        hasPlan && index === lastActivity, openDetails));
     }
     const error = turn.error
       ? '<div class="item" style="color:var(--danger);font-size:13px">' +
@@ -2126,7 +2427,6 @@ function renderThread() {
     parts.push(
       '<div class="turn' + running + '" data-turn-id="' + escapeHtml(turn.id) + '">' +
         body.join('') +
-        renderPlan(turn.id) +
         error +
         '</div>'
     );
@@ -2142,11 +2442,6 @@ function renderThread() {
   if (started) parts.push(runIndicatorMarkup(formatElapsed(Date.now() / 1000 - started.at)));
 
   /* 运行中每 2 秒会重画一次：保留用户展开的思考/工具详情，别一刷新就折叠回去 */
-  const openDetails = new Set(
-    [...dom.turns.querySelectorAll('details[open][data-item-id]')].map((el) =>
-      el.getAttribute('data-item-id')
-    )
-  );
   const keepScrollTop = dom.turns.scrollTop;
   dom.turns.innerHTML = parts.join('');
   for (const id of openDetails) {
@@ -2477,7 +2772,10 @@ function updateThreadActions() {
   const has = Boolean(state.currentThreadId);
   dom.renameButton.hidden = !has;
   dom.pinButton.hidden = !has;
-  dom.pinButton.textContent = has && isPinned(state.currentThreadId) ? '★' : '☆';
+  const pinned = has && isPinned(state.currentThreadId);
+  dom.pinButton.classList.toggle('pinned', pinned);
+  dom.pinButton.title = pinned ? '取消置顶' : '置顶会话';
+  dom.pinButton.setAttribute('aria-label', pinned ? '取消置顶' : '置顶会话');
   const ephemeral = Boolean(state.thread && state.thread.ephemeral);
   dom.ephemeralClose.hidden = !ephemeral;
 }
@@ -2512,6 +2810,9 @@ function openNewChatPanel(options) {
   dom.newChatCwd.value = presetCwd;
   renderProjectOptions(presetCwd);
   dom.newChatPermission.value = 'default';
+  renderModelChoices(dom.newChatModel, '');
+  renderEffortChoices(dom.newChatModel, dom.newChatEffort);
+  if (!state.models.length && !state.modelsLoading) loadModels();
   dom.newChatPin.checked = false;
   dom.newChatHeading.textContent = preset.projectName
     ? '在「' + preset.projectName + '」下新建对话'
@@ -2528,8 +2829,10 @@ async function submitNewChat() {
   const cwd = dom.newChatCwd.value.trim();
   const permission = dom.newChatPermission.value || 'default';
   const shouldPin = dom.newChatPin.checked;
+  const model = dom.newChatModel.value || null;
+  const reasoningEffort = model ? dom.newChatEffort.value || null : null;
   closeNewChatPanel();
-  const thread = await createThread({ name, cwd, permission, pin: shouldPin });
+  const thread = await createThread({ name, cwd, permission, model, reasoningEffort, pin: shouldPin });
   if (thread) toast(name ? '已创建「' + name + '」' : '新对话已创建，可点 ✎ 重命名');
 }
 
@@ -2543,7 +2846,7 @@ async function createThread(options) {
   try {
     const result = await api('/api/new-thread', {
       method: 'POST',
-      body: JSON.stringify({ name, cwd, permission, ephemeral }),
+      body: JSON.stringify({ name, cwd, permission, ephemeral, model: options.model || null, reasoningEffort: options.reasoningEffort || null }),
     });
     if (cwd) localStorage.setItem('codex.lastCwd', cwd);
     const thread = result?.thread;
@@ -2700,6 +3003,7 @@ async function openThread(threadId, options) {
     if (switching && state.currentThreadId) saveDraft(state.currentThreadId);
     if (switching) restoreDraft(threadId);
     state.currentThreadId = threadId;
+    toggleModelPanel(false);
     if (switching) {
       stopLivePolling();
       state.turns = [];
@@ -2710,10 +3014,12 @@ async function openThread(threadId, options) {
       state.turnLimit = 20;
       state.hasMore = false;
       state.omittedItems = 0;
+      state.modelSelection = null;
+      renderModel();
     }
     dom.composer.hidden = false;
     dom.threadMeta.textContent = '';
-    dom.turns.innerHTML = '<p style="color:var(--text-faint)">载入中…</p>';
+    dom.turns.innerHTML = '<div class="loading-state"><span class="spinner" aria-hidden="true"></span><span>载入会话…</span></div>';
     clearUnread(threadId);
     renderList();
     if (isNarrow()) closeSidebar();
@@ -2730,11 +3036,12 @@ async function openThread(threadId, options) {
         '&turns=' +
         (state.turnLimit || 20)
     );
-    if (silent && state.currentThreadId !== threadId) return;
+    if (state.currentThreadId !== threadId) return;
     state.thread = result.thread;
     state.omittedItems = Number(state.thread && state.thread.omittedItems) || 0;
     state.hasMore = Boolean(result.hasMore);
     state.permission = result.permission || { mode: 'default', effective: null };
+    state.modelSelection = result.modelSelection || { model: null, reasoningEffort: null, effective: null };
     state.attached[threadId] = Boolean(result.attached) || Boolean(state.thread && state.thread.ephemeral);
     updateThreadActions();
     /* 正在跑的那一轮，服务端读回来的内容可能是不全的（实测工具调用那条会消失十几秒，
@@ -2773,8 +3080,9 @@ async function openThread(threadId, options) {
     renderListQuiet();
     finalizeEchoes();
     dom.title.textContent = (state.thread.name || state.thread.preview || '会话').slice(0, 60);
-    dom.threadMeta.textContent = [state.thread.cwd, state.thread.model].filter(Boolean).join(' · ');
+    renderThreadMeta();
     renderPermission();
+    renderModel();
     renderThread();
     renderApprovals();
     saveLastThread(threadId);
@@ -3173,6 +3481,11 @@ async function pollLiveThread(threadId) {
     const result = await api('/api/threads/' + encodeURIComponent(threadId) + '/live');
     if (state.currentThreadId !== threadId) return;
     if (typeof result.attached === 'boolean') state.attached[threadId] = result.attached;
+    if (result.modelSelection) {
+      state.modelSelection = result.modelSelection;
+      renderModel();
+      renderThreadMeta();
+    }
     const turn = result.turn;
     if (!turn) {
       if (!result.running) stopLivePolling();
@@ -3305,6 +3618,18 @@ function bindEvents() {
   dom.scrim.addEventListener('click', closeSidebar);
   dom.refreshButton.addEventListener('click', refreshCurrent);
   dom.themeButton.addEventListener('click', cycleTheme);
+  dom.sidebarSearchInput.addEventListener('input', () => {
+    state.threadQuery = dom.sidebarSearchInput.value;
+    renderList();
+  });
+  dom.sidebarSearchInput.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape') return;
+    event.preventDefault();
+    dom.sidebarSearchInput.value = '';
+    state.threadQuery = '';
+    renderList();
+    dom.sidebarSearchInput.blur();
+  });
   dom.newChatButton.addEventListener('click', () => openNewChatPanel());
   dom.newChatCancel.addEventListener('click', closeNewChatPanel);
   if (dom.newChatProject) {
@@ -3318,6 +3643,7 @@ function bindEvents() {
     if (dom.newChatCwd.value.trim() !== dom.newChatProject.value) dom.newChatProject.value = '';
   });
   dom.newChatCreate.addEventListener('click', submitNewChat);
+  dom.newChatModel.addEventListener('change', () => renderEffortChoices(dom.newChatModel, dom.newChatEffort));
   dom.newChatModal.addEventListener('click', (event) => {
     if (event.target === dom.newChatModal) closeNewChatPanel();
   });
@@ -3340,6 +3666,18 @@ function bindEvents() {
     });
   }
   dom.ephemeralClose.addEventListener('click', closeEphemeralThread);
+  dom.turns.addEventListener('toggle', (event) => {
+    const details = event.target;
+    if (details && details.classList.contains('activity') && dom.turns.contains(details)) hydrateActivity(details);
+  }, true);
+  /* 首屏空状态里的两个按钮：新建普通对话 / 临时对话 */
+  dom.turns.addEventListener('click', (event) => {
+    const target = event.target;
+    const button = target && target.closest ? target.closest('[data-empty-action]') : null;
+    if (!button) return;
+    if (button.dataset.emptyAction === 'ephemeral') openEphemeralChat();
+    else openNewChatPanel();
+  });
   /* 运行中的「接管」：加入桌面端正在跑的那一轮，之后中断/引导都直接生效 */
   dom.turns.addEventListener('click', (event) => {
     const target = event.target;
@@ -3511,11 +3849,20 @@ function bindEvents() {
     if (option) setPermission(option.dataset.mode);
   });
 
+  dom.modelButton.addEventListener('click', (event) => {
+    event.stopPropagation();
+    toggleModelPanel();
+  });
+  dom.modelSelect.addEventListener('change', renderModelDraft);
+  dom.modelApply.addEventListener('click', applyModelSelection);
+  dom.modelRetry.addEventListener('click', () => loadModels(true));
+
   document.addEventListener('click', (event) => {
     if (!dom.latencyPanel.hidden && !dom.latencyPanel.contains(event.target)) toggleLatencyPanel(false);
     if (!dom.permissionPanel.hidden && !dom.permissionPanel.contains(event.target)) {
       togglePermissionPanel(false);
     }
+    if (!dom.modelPanel.hidden && !dom.modelPanel.contains(event.target)) toggleModelPanel(false);
   });
 
   dom.turns.addEventListener('error', (event) => {
@@ -3530,6 +3877,7 @@ document.addEventListener('visibilitychange', () => {
   if (document.hidden) {
     toggleLatencyPanel(false);
     togglePermissionPanel(false);
+    toggleModelPanel(false);
     return;
   }
   refreshIfVisible();
@@ -3578,6 +3926,11 @@ connectEvents();
 renderPlaceholder();
 loadBridgeMeta();
 loadPermissions();
+renderModelChoices(dom.modelSelect, '');
+renderEffortChoices(dom.modelSelect, dom.modelEffort);
+renderModelChoices(dom.newChatModel, '');
+renderEffortChoices(dom.newChatModel, dom.newChatEffort);
+loadModels();
 loadProjects();
 loadThreads().then(restoreLastThread);
 measureLatency();
@@ -3621,7 +3974,23 @@ window.addEventListener('focus', refreshIfVisible);
 window.addEventListener('online', refreshIfVisible);
 
 document.addEventListener('keydown', (event) => {
+  /* ⌘K / Ctrl+K：把焦点送到侧边栏搜索框，手机上顺手把抽屉打开 */
+  if ((event.metaKey || event.ctrlKey) && !event.altKey && (event.key === 'k' || event.key === 'K')) {
+    if (isNarrow()) openSidebar();
+    else if (sidebarCollapsed()) setSidebarCollapsed(false);
+    event.preventDefault();
+    dom.sidebarSearchInput.focus();
+    dom.sidebarSearchInput.select();
+    return;
+  }
+  /* ⌘N / Ctrl+N：新建对话（浏览器里会先问要不要开新窗口时，我们接管掉） */
+  if ((event.metaKey || event.ctrlKey) && !event.altKey && (event.key === 'n' || event.key === 'N')) {
+    event.preventDefault();
+    openNewChatPanel();
+    return;
+  }
   if (event.key !== 'Escape') return;
   closeSidebar();
   togglePermissionPanel(false);
+  toggleModelPanel(false);
 });

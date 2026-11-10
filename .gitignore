@@ -12,3 +12,12 @@ promo/
 *.pem
 *.key
 .env
+
+# macOS client build output
+macos/.build/
+macos/build/
+macos/.swiftpm/
+
+# local UI review screenshots and captured streams
+ui-*.png
+azure-stream-*/

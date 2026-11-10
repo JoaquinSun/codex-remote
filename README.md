@@ -6,6 +6,34 @@ Pick up the Codex session running on your desktop from your phone: read the hist
 
 > Both language versions are maintained by hand — please update both when you change a feature.
 
+This is [JoaquinSun's fork](https://github.com/JoaquinSun/codex-remote) of
+[KotChiu/codex-remote](https://github.com/KotChiu/codex-remote). The original bridge and its Git history are
+preserved. This fork adds a native macOS companion, per-session model selection, folded execution history,
+and an updated browser UI. It is a community project, unaffiliated with OpenAI.
+
+## Download the macOS app
+
+Get **Codex Remote Server** from [Releases](https://github.com/JoaquinSun/codex-remote/releases/latest).
+
+- Requires **macOS 14 or later on Apple Silicon** (M-series), the Codex desktop app installed and signed in,
+  and Node.js 18 or later (or the Node runtime included with Codex).
+- Extract the ZIP, move `Codex Remote Server.app` to Applications, and launch it. The bridge code is included;
+  Node.js is detected on the Mac rather than bundled into the download.
+- Start or stop the bridge in the main window, then copy an access URL into your phone's browser. The phone
+  and Mac need to be on the same LAN or Tailscale network.
+- The gear button expands settings **inside the main window**; `⌘,` and the menu-bar Settings item open the same
+  section. No QR-code setup is required.
+- If a bridge is already running under launchd, the app attaches to it and displays it as externally managed.
+  Update or stop that service through its existing deployment before switching to the app-managed bridge.
+- The downloadable app uses an ad-hoc signature and is **not Apple-notarized**. macOS may require you to review
+  it in System Settings → Privacy & Security before its first launch.
+- `SHA256SUMS.txt` is provided alongside the ZIP so you can verify the downloaded archive with `shasum -a 256`.
+
+The app and source releases exclude local tokens, logs, conversation captures, screenshots of real sessions,
+and developer build caches. Example data uses documentation-only addresses and a nonfunctional token.
+
+Build it locally with `bash scripts/build-macos.sh`; outputs go into `macos/build/`.
+
 ## How it works
 
 Rather than spawning another agent, the bridge attaches to **the same app-server daemon the desktop app is already using**
@@ -31,7 +59,7 @@ Prerequisites:
 ### 1. Get the code
 
 ```bash
-git clone https://github.com/KotChiu/codex-remote.git ~/codex-remote
+git clone https://github.com/JoaquinSun/codex-remote.git ~/codex-remote
 cd ~/codex-remote
 ```
 
@@ -39,7 +67,7 @@ If git is unusable (for example broken Xcode command line tools, `/usr/bin/git` 
 
 ```bash
 mkdir -p ~/codex-remote && cd ~/codex-remote
-curl -L -o main.zip https://github.com/KotChiu/codex-remote/archive/refs/heads/main.zip
+curl -L -o main.zip https://github.com/JoaquinSun/codex-remote/archive/refs/heads/main.zip
 unzip -q main.zip && mv codex-remote-main/* .
 ```
 
@@ -98,7 +126,7 @@ The token is stored in `~/.codex-remote/token` (mode 600).
 2. Open the tokenized address in a browser.
 3. On iOS you can "Add to Home Screen"; it opens full screen like an app.
 
-The UI follows the desktop Codex palette (background `#111111`, sidebar `#131313`, accent `#0169cc`).
+The UI uses a Codex-inspired light/dark palette, SVG controls, and a searchable session sidebar (`⌘K` / `Ctrl+K`).
 On wide screens the session sidebar is always visible; on phones (≤767px) it collapses into a drawer —
 tap ☰ at the top left to slide it out, and it closes once you pick a session.
 
@@ -106,8 +134,19 @@ What you can do:
 
 - **Session list** in the sidebar: name, preview, running state (running / waiting for approval), relative time;
   the current session is highlighted.
-- **Session view**: your messages, agent replies (Markdown), reasoning, command executions (command + exit code + output),
-  file changes, plans.
+- **Session view**: your messages and agent replies (Markdown) stay in the main conversation. Commentary, reasoning,
+  commands, tool calls, and file changes are grouped into a collapsed **Execution history** summary. While running,
+  the summary shows the latest progress and current activity; when finished it shows execution / file / tool counts
+  and any failed steps. Expand it to inspect commands, exit codes, output, reasoning, diffs, and plans. Details are
+  rendered on demand, and expanded sections stay open during live updates. Older providers without a message `phase`
+  still keep their final reply visible; user steering and partial answers keep their original order.
+- **Per-session model switching**: the model button above the composer opens a model and reasoning-effort picker.
+  Choices come from the connected Codex daemon's `model/list` catalog. The bridge validates supported efforts and
+  saves each session's choice in `~/.codex-remote/models.json`; refreshes and other browsers on the same bridge keep it.
+  It applies to the next new turn, including the `codex queue` fallback when the desktop owns the session. Steering
+  keeps the active turn's model. **Follow desktop** removes the bridge's override, and the panel separately shows the
+  model currently in effect. New chats can pick a model before creation; ephemeral chat choices stay in memory.
+  The catalog describes selectable models; the provider still determines inference access when a turn runs.
 - Keep going with the composer at the bottom; press **Interrupt** while a turn is running.
 - **Unread dot**: when a session finishes a turn while you are not looking at it (or the page is in the background),
   a small blue dot appears in front of its name in the list; opening that session clears it. The state lives in the
@@ -282,6 +321,7 @@ Logs: `~/.codex-remote/bridge.log`
 | `--token-file` | `~/.codex-remote/token` | Token file; delete it to regenerate |
 | `--name` | hostname | Name shown in the page/tab, to tell computers apart |
 | `--name-file` | `~/.codex-remote/name` | Persisted name; `CODEX_REMOTE_NAME` also works |
+| `--model-file` | `~/.codex-remote/models.json` | Persisted per-session model and reasoning-effort choices |
 
 ## Security
 
@@ -323,7 +363,9 @@ src/ws-unix.js              WebSocket-over-Unix-socket client (zero dependencies
 src/appserver.js            app-server JSON-RPC 2.0 client
 src/codex-cli.js            locate the codex CLI + queue delivery (fallback when busy)
 src/permissions.js          per-session permission profiles, persisted to disk
+src/models.js               model catalog validation, per-session choices, RPC parameters
 src/server.js               HTTP + SSE bridge, auth, approval forwarding
+public/chat-view.js          conversation / execution grouping and activity summaries
 public/                     phone UI
 launchd/                    background service template
 scripts/probe.js            connectivity probe, lists sessions directly
@@ -331,6 +373,24 @@ scripts/install-launchd.sh  install the background service
 ```
 
 ## Verifying
+
+Run the regression checks without installing dependencies:
+
+```bash
+node --test
+```
+
+They cover model selection and persistence, next-turn RPC parameters, queue delivery, steering, ephemeral chats,
+and conversation grouping for current and older message formats.
+
+Run the macOS client's restart, listener, and access URL regression tests with:
+
+```bash
+swift test --package-path macos
+```
+
+These use simulated processes, HTTP responses, and isolated settings without starting or stopping the user's
+bridge or modifying existing sessions.
 
 ```bash
 # talk to the daemon directly and list sessions
@@ -355,7 +415,7 @@ Run one bridge per machine and tell them apart by page name (hostname by default
 
 - Tap the name at the top of the sidebar to rename it; stored in `~/.codex-remote/name`
 - Or `bin/codex-remote --name "My Mac"`, or the `CODEX_REMOTE_NAME` environment variable
-- `GET /api/meta` returns `{name, hostname, version, startedAt}` — one glance tells you which machine you are on
+- `GET /api/meta` returns `{name, hostname, listenHost, version, startedAt}` — the machine name and actual listener
 
 ### Updating and redeploying
 
@@ -363,7 +423,7 @@ Whichever way you got the code, the last step is always `install-launchd.sh`: it
 `~/.codex-remote/app`, rewrites the plist and restarts the LaunchAgent (about 10 seconds of downtime).
 
 ```bash
-git clone https://github.com/KotChiu/codex-remote.git ~/codex-remote   # first time
+git clone https://github.com/JoaquinSun/codex-remote.git ~/codex-remote   # first time
 cd ~/codex-remote && git pull && bash scripts/install-launchd.sh      # afterwards
 ```
 
@@ -371,7 +431,7 @@ On a machine where git is unusable (`/usr/bin/git`'s CommandLineTools are broken
 
 ```bash
 mkdir -p ~/codex-remote && cd ~/codex-remote
-curl -L -o main.zip https://github.com/KotChiu/codex-remote/archive/refs/heads/main.zip
+curl -L -o main.zip https://github.com/JoaquinSun/codex-remote/archive/refs/heads/main.zip
 unzip -q -o main.zip && bash codex-remote-main/scripts/install-launchd.sh
 ```
 
@@ -418,15 +478,18 @@ You will inevitably send a few real messages while working on this; do not leave
 
 ## Repository
 
-Code lives on GitHub: <https://github.com/KotChiu/codex-remote>
+Code lives on GitHub: <https://github.com/JoaquinSun/codex-remote>
 
 ```bash
-git clone https://github.com/KotChiu/codex-remote.git
-git remote add origin https://github.com/KotChiu/codex-remote.git   # in an existing checkout
+git clone https://github.com/JoaquinSun/codex-remote.git
+git remote add origin https://github.com/JoaquinSun/codex-remote.git   # in an existing checkout
 ```
 
-Release flow: change code → `bash scripts/install-launchd.sh` to deploy → `git add -A && git commit` →
-`git push origin main`. Refresh the page once on the phone to pick it up.
+For an app release: run `node --test` and `swift test --package-path macos`, build with
+`bash scripts/build-macos.sh`, commit the source, tag that commit, and attach the ZIP plus `SHA256SUMS.txt`
+to a GitHub Release. Local build output, credentials, and captured sessions are excluded from Git.
+
+For a launchd deployment, use `bash scripts/install-launchd.sh` and refresh the phone page.
 
 Before you publish changes, make sure git works on macOS: `git --version` failing with `xcrun: ... missing xcrun`
 means the Xcode command line tools are missing (`/usr/bin/git` is just a shim) — run `xcode-select --install` once.

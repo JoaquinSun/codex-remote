@@ -6,6 +6,29 @@
 
 > 两个语言版本都是手工维护的，改功能时请一起更新。
 
+这是 [JoaquinSun 维护的 fork](https://github.com/JoaquinSun/codex-remote)，上游为
+[KotChiu/codex-remote](https://github.com/KotChiu/codex-remote)。保留原项目的桥接实现和 Git 历史，
+新增 macOS 原生管理客户端、按会话切换模型、执行过程折叠和新版浏览器界面。本项目由社区维护，与 OpenAI 无隶属关系。
+
+## 下载 macOS App
+
+在 [Releases](https://github.com/JoaquinSun/codex-remote/releases/latest) 下载 **Codex Remote Server**。
+
+- 需要 **Apple Silicon（M 系列）Mac、macOS 14 或更高版本**、已安装并登录的 Codex 桌面 App，
+  以及 Node.js 18 或更高版本（也可以使用 Codex 自带的 Node 运行时）。
+- 解压 ZIP，将 `Codex Remote Server.app` 放进「应用程序」后打开。App 已包含桥接代码，
+  Node.js 从本机自动检测，下载包里不另带 Node.js。
+- 在主窗口启动或停止服务，复制接入地址到手机浏览器。手机与 Mac 需要处于同一局域网或接入 Tailscale。
+- 点击齿轮会在**主窗口内**展开设置；`⌘,` 和菜单栏的「设置」也会打开同一区域。通过接入地址连接，无需二维码。
+- 如果已有 launchd 桥接服务，App 会连接它并显示为外部进程托管。切换到 App 管理之前，
+  请通过原部署方式更新或停止已有服务。
+- 下载包使用临时签名，**未经过 Apple 公证**；首次打开时，macOS 可能要求在「系统设置 → 隐私与安全性」中确认。
+- 同时提供 `SHA256SUMS.txt`，可以用 `shasum -a 256` 核对下载包。
+
+App 与源码发行版不包含本机令牌、日志、会话抓取、真实会话截图或开发缓存；演示数据使用文档示例地址和无效令牌。
+
+本地构建运行 `bash scripts/build-macos.sh`，产物位于 `macos/build/`。
+
 ## 核心思路
 
 不另起一个 agent，而是接上**桌面 App 已经在用的那个 app-server daemon**
@@ -31,7 +54,7 @@
 ### 1. 拿代码
 
 ```bash
-git clone https://github.com/KotChiu/codex-remote.git ~/codex-remote
+git clone https://github.com/JoaquinSun/codex-remote.git ~/codex-remote
 cd ~/codex-remote
 ```
 
@@ -39,7 +62,7 @@ git 不可用（例如 Xcode 命令行工具损坏、`/usr/bin/git` 报 `xcrun` 
 
 ```bash
 mkdir -p ~/codex-remote && cd ~/codex-remote
-curl -L -o main.zip https://github.com/KotChiu/codex-remote/archive/refs/heads/main.zip
+curl -L -o main.zip https://github.com/JoaquinSun/codex-remote/archive/refs/heads/main.zip
 unzip -q main.zip && mv codex-remote-main/* .
 ```
 
@@ -97,13 +120,21 @@ token 保存在 `~/.codex-remote/token`（权限 600）。
 2. 浏览器打开上面那个带 token 的地址。
 3. iOS 可以「添加到主屏幕」，会以全屏 App 的形式打开。
 
-界面沿用 Codex 桌面版的配色（背景 `#111111`、侧边栏 `#131313`、强调色 `#0169cc`），
+界面采用接近 Codex 的深浅配色与 SVG 控件，会话侧边栏支持搜索（`⌘K` / `Ctrl+K`），
 宽屏时左侧常驻会话侧边栏，手机（≤767px）上侧边栏收成抽屉，点左上角 ☰ 滑出、选完自动收起。
 
 界面上能做的事：
 
 - 侧边栏会话列表：名称、预览、运行状态（运行中 / 待审批）、相对时间；当前会话高亮。
-- 会话详情：用户消息、Agent 回复（Markdown）、思考过程、命令执行（命令 + 退出码 + 输出）、文件改动、计划。
+- **会话详情**：用户消息和 Agent 回复（Markdown）保留在主要聊天流中；进度说明、思考、命令、工具调用和文件
+  改动收进默认折叠的「执行过程」。运行时摘要显示最新进度和当前活动，结束后显示执行次数、文件数量、工具
+  数量和失败步骤。点开仍能查看命令、退出码、输出、思考、差异与计划。详细内容按需渲染，实时更新和轮询
+  会保留已展开的区域。旧版模型不带消息 `phase` 也会保留最终回复；引导消息和阶段性回答按原顺序显示。
+- **按会话切换模型**：输入框上方的模型按钮可选择模型与思考强度，选项来自当前 Codex daemon 的 `model/list`。
+  桥接会验证模型支持的强度，并把每个会话的选择存在 `~/.codex-remote/models.json`，刷新页面或用同一桥接的
+  其他浏览器打开仍会保留。设置从下一轮消息开始生效，电脑占用时的 `codex queue` 排队路径也会带上；「引导」
+  保持当前轮的模型。「跟随电脑」清除桥接覆盖，面板单独显示当前实际使用的模型。新建对话时也可以选模型，
+  临时对话的选择只存在内存中。模型列表描述可选项，实际推理访问仍由所用服务决定。
 - 底部输入框继续发指令；任务运行时可以「中断」。
 - **未读小圆点**：某个会话跑完一轮时你没在看它（或者页面在后台），列表里它名字前面会出现一个蓝色小圆点，
   点开这个会话就自动清掉。状态存在浏览器 `localStorage`（`codex.unread`），刷新页面也还在。
@@ -266,6 +297,7 @@ token 保存在 `~/.codex-remote/token`（权限 600）。
 | `--token-file` | `~/.codex-remote/token` | token 文件；删掉会重新生成 |
 | `--name` | 主机名 | 页面/标签页显示的名字，用来区分多台电脑 |
 | `--name-file` | `~/.codex-remote/name` | 名字的持久化文件，也可以直接用环境变量 `CODEX_REMOTE_NAME` |
+| `--model-file` | `~/.codex-remote/models.json` | 每个会话的模型与思考强度持久化文件 |
 
 ## 安全
 
@@ -306,7 +338,9 @@ src/ws-unix.js              WebSocket over Unix socket 客户端（零依赖实�
 src/appserver.js            app-server JSON-RPC 2.0 客户端
 src/codex-cli.js            codex CLI 定位 + 排队投递（占用时兜底）
 src/permissions.js          会话权限档位定义与落盘
+src/models.js               模型列表校验、会话模型选择与 RPC 参数
 src/server.js               HTTP + SSE 桥接，鉴权，审批转发
+public/chat-view.js          消息与执行过程分组、活动摘要
 public/                     手机端界面
 launchd/                    常驻服务模板
 scripts/probe.js            连通性探针，直接列会话
@@ -314,6 +348,22 @@ scripts/install-launchd.sh  安装常驻服务
 ```
 
 ## 验证
+
+不用安装依赖，直接运行回归测试：
+
+```bash
+node --test
+```
+
+覆盖模型选择与保存、下一轮 RPC 参数、排队投递、引导、临时对话，以及新旧消息格式的分组展示。
+
+macOS 客户端的服务重启、监听范围和接入地址回归测试：
+
+```bash
+swift test --package-path macos
+```
+
+测试使用模拟进程、HTTP 响应和独立设置，不会启停实际桥接服务或修改已有会话。
 
 ```bash
 # 直连 daemon，列出会话
@@ -338,7 +388,7 @@ curl -s -H "Authorization: Bearer $(cat ~/.codex-remote/token)" -H 'content-type
 
 - 手机上直接点侧边栏顶部的名字就能改，写进 `~/.codex-remote/name`
 - 也可以 `bin/codex-remote --name "我的 Mac"`，或用环境变量 `CODEX_REMOTE_NAME`
-- `GET /api/meta` 返回 `{name, hostname, version, startedAt}`，一眼看出连的是哪台
+- `GET /api/meta` 返回 `{name, hostname, listenHost, version, startedAt}`，包含电脑名称和实际监听地址
 
 ### 更新代码并重新部署
 
@@ -346,7 +396,7 @@ curl -s -H "Authorization: Bearer $(cat ~/.codex-remote/token)" -H 'content-type
 `~/.codex-remote/app`，重写 plist 并重启 LaunchAgent（服务会中断约 10 秒）。
 
 ```bash
-git clone https://github.com/KotChiu/codex-remote.git ~/codex-remote   # 首次
+git clone https://github.com/JoaquinSun/codex-remote.git ~/codex-remote   # 首次
 cd ~/codex-remote && git pull && bash scripts/install-launchd.sh      # 之后
 ```
 
@@ -354,7 +404,7 @@ cd ~/codex-remote && git pull && bash scripts/install-launchd.sh      # 之后
 
 ```bash
 mkdir -p ~/codex-remote && cd ~/codex-remote
-curl -L -o main.zip https://github.com/KotChiu/codex-remote/archive/refs/heads/main.zip
+curl -L -o main.zip https://github.com/JoaquinSun/codex-remote/archive/refs/heads/main.zip
 unzip -q -o main.zip && bash codex-remote-main/scripts/install-launchd.sh
 ```
 
@@ -400,15 +450,17 @@ tail -20 ~/.codex-remote/bridge.log                                  # 出错时
 
 ## 仓库
 
-代码托管在 GitHub：<https://github.com/KotChiu/codex-remote>
+代码托管在 GitHub：<https://github.com/JoaquinSun/codex-remote>
 
 ```bash
-git clone https://github.com/KotChiu/codex-remote.git
-git remote add origin https://github.com/KotChiu/codex-remote.git   # 已有目录时
+git clone https://github.com/JoaquinSun/codex-remote.git
+git remote add origin https://github.com/JoaquinSun/codex-remote.git   # 已有目录时
 ```
 
-发布流程：改完代码 → `bash scripts/install-launchd.sh` 部署 → `git add -A && git commit`
-→ `git push origin main`。手机上刷新一次页面就能拿到新版。
+App 发布流程：运行 `node --test` 和 `swift test --package-path macos`，再执行 `bash scripts/build-macos.sh`，
+提交源码并给该提交打标签，将 ZIP 与 `SHA256SUMS.txt` 上传到 GitHub Release。构建产物、凭据和捕获的会话不会提交到 Git。
+
+使用 launchd 部署时，运行 `bash scripts/install-launchd.sh`，然后刷新手机页面。
 
 macOS 上先确认 git 可用：`git --version` 报 `xcrun: ... missing xcrun` 说明 Xcode 命令行工具
 缺失（`/usr/bin/git` 只是它的壳），执行一次 `xcode-select --install` 即可修好；不想装 Xcode

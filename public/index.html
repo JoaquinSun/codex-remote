@@ -8,7 +8,7 @@
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <link
       rel="icon"
-      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23111111'/%3E%3Cpath d='M9 11l5 5-5 5' stroke='%23fcfcfc' stroke-width='2.4' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3Cpath d='M17 21h7' stroke='%230169cc' stroke-width='2.4' stroke-linecap='round'/%3E%3C/svg%3E"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230f0f0f'/%3E%3Cpath d='M9.5 11.5 14 16l-4.5 4.5' stroke='%23f5f5f5' stroke-width='2.2' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3Cpath d='M17 20.5h6' stroke='%234da3ff' stroke-width='2.2' stroke-linecap='round'/%3E%3C/svg%3E"
     />
     <title>Codex Remote</title>
     <script>
@@ -34,26 +34,155 @@
     <link rel="stylesheet" href="/style.css" />
   </head>
   <body>
+    <svg id="icon-sprite" aria-hidden="true" focusable="false" width="0" height="0">
+      <defs>
+        <symbol id="i-logo" viewBox="0 0 32 32">
+          <rect x="2.5" y="2.5" width="27" height="27" rx="8" fill="none" stroke="currentColor" stroke-width="2" />
+          <path d="M9.8 11.6 14.2 16l-4.4 4.4" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" />
+          <path d="M17 20.4h5.4" fill="none" stroke="var(--accent)" stroke-width="2.2" stroke-linecap="round" />
+        </symbol>
+        <symbol id="i-menu" viewBox="0 0 24 24">
+          <path d="M4 7h16M4 12h16M4 17h16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" />
+        </symbol>
+        <symbol id="i-panel-left" viewBox="0 0 24 24">
+          <rect x="3.2" y="4.2" width="17.6" height="15.6" rx="3" fill="none" stroke="currentColor" stroke-width="1.7" />
+          <path d="M9.2 4.2v15.6" fill="none" stroke="currentColor" stroke-width="1.7" />
+        </symbol>
+        <symbol id="i-refresh" viewBox="0 0 24 24">
+          <path d="M19.4 12a7.4 7.4 0 1 1-2.16-5.23M19.4 5v5.2h-5.2" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" />
+        </symbol>
+        <symbol id="i-chevron-left" viewBox="0 0 24 24">
+          <path d="M14.5 5.5 8 12l6.5 6.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+        </symbol>
+        <symbol id="i-chevron-right" viewBox="0 0 24 24">
+          <path d="M9.5 5.5 16 12l-6.5 6.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+        </symbol>
+        <symbol id="i-chevron-down" viewBox="0 0 24 24">
+          <path d="M5.5 9.5 12 16l6.5-6.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+        </symbol>
+        <symbol id="i-x" viewBox="0 0 24 24">
+          <path d="M6 6l12 12M18 6 6 18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
+        </symbol>
+        <symbol id="i-plus" viewBox="0 0 24 24">
+          <path d="M12 5v14M5 12h14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
+        </symbol>
+        <symbol id="i-sun" viewBox="0 0 24 24">
+          <circle cx="12" cy="12" r="4.2" fill="none" stroke="currentColor" stroke-width="1.7" />
+          <path d="M12 2.8v2.1M12 19.1v2.1M2.8 12h2.1M19.1 12h2.1M5.5 5.5l1.5 1.5M17 17l1.5 1.5M18.5 5.5 17 7M7 17l-1.5 1.5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" />
+        </symbol>
+        <symbol id="i-moon" viewBox="0 0 24 24">
+          <path d="M20 14.2A8 8 0 0 1 9.8 4 8.2 8.2 0 1 0 20 14.2Z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" />
+        </symbol>
+        <symbol id="i-auto" viewBox="0 0 24 24">
+          <circle cx="12" cy="12" r="8" fill="none" stroke="currentColor" stroke-width="1.7" />
+          <path d="M12 4a8 8 0 0 1 0 16Z" fill="currentColor" />
+        </symbol>
+        <symbol id="i-sparkle" viewBox="0 0 24 24">
+          <path d="M12 3.5c.7 4.4 2.1 5.8 6.5 6.5-4.4.7-5.8 2.1-6.5 6.5-.7-4.4-2.1-5.8-6.5-6.5 4.4-.7 5.8-2.1 6.5-6.5Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" />
+          <path d="M18.5 15.5c.35 2.2 1.05 2.9 3.25 3.25-2.2.35-2.9 1.05-3.25 3.25-.35-2.2-1.05-2.9-3.25-3.25 2.2-.35 2.9-1.05 3.25-3.25Z" fill="currentColor" />
+        </symbol>
+        <symbol id="i-search" viewBox="0 0 24 24">
+          <circle cx="10.8" cy="10.8" r="6.3" fill="none" stroke="currentColor" stroke-width="1.7" />
+          <path d="m15.5 15.5 4.2 4.2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
+        </symbol>
+        <symbol id="i-folder" viewBox="0 0 24 24">
+          <path d="M3.4 7.2a2 2 0 0 1 2-2h3.3l2 2.2h6a2 2 0 0 1 2 2v7.4a2 2 0 0 1-2 2H5.4a2 2 0 0 1-2-2Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" />
+        </symbol>
+        <symbol id="i-star" viewBox="0 0 24 24">
+          <path d="m12 3.9 2.47 4.9 5.43.74-3.95 3.8.98 5.36L12 16.14l-4.93 2.56.98-5.36-3.95-3.8 5.43-.74Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" />
+        </symbol>
+        <symbol id="i-pencil" viewBox="0 0 24 24">
+          <path d="M4.5 19.5h4l10-10a2.12 2.12 0 0 0-3-3l-10 10Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" />
+          <path d="m13.7 8.3 3 3" fill="none" stroke="currentColor" stroke-width="1.6" />
+        </symbol>
+        <symbol id="i-arrow-up" viewBox="0 0 24 24">
+          <path d="M12 19V5.5M6.2 11.3 12 5.5l5.8 5.8" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" />
+        </symbol>
+        <symbol id="i-arrow-down" viewBox="0 0 24 24">
+          <path d="M12 4.5V19M6 13.2 12 19l6-5.8" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+        </symbol>
+        <symbol id="i-stop" viewBox="0 0 24 24">
+          <rect x="6.5" y="6.5" width="11" height="11" rx="2.2" fill="currentColor" />
+        </symbol>
+        <symbol id="i-paperclip" viewBox="0 0 24 24">
+          <path d="M8.2 12.6 14 6.8a3.1 3.1 0 0 1 4.4 4.4l-7 7a5 5 0 0 1-7.1-7.1l7.4-7.4" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" />
+        </symbol>
+        <symbol id="i-warning" viewBox="0 0 24 24">
+          <path d="M12 4.2 21 20H3Z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" />
+          <path d="M12 9.4v4.6" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" />
+          <circle cx="12" cy="17.1" r="0.6" fill="currentColor" />
+        </symbol>
+        <symbol id="i-clock" viewBox="0 0 24 24">
+          <circle cx="12" cy="12" r="8.2" fill="none" stroke="currentColor" stroke-width="1.6" />
+          <path d="M12 7.4V12l3 1.8" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" />
+        </symbol>
+        <symbol id="i-command" viewBox="0 0 24 24">
+          <path d="M9 9h6v6H9zM9 9H7.2A2.2 2.2 0 1 1 9.4 6.8V9Zm5.6-2.2A2.2 2.2 0 1 1 16.8 9H15V6.8ZM9 15v2.2a2.2 2.2 0 1 1-2.2-2.2H9Zm6 0h2.2a2.2 2.2 0 1 1-2.2 2.2V15Z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" />
+        </symbol>
+      </defs>
+    </svg>
+
     <div id="app">
       <aside id="sidebar" aria-label="会话列表">
         <div id="sidebar-head">
-          <span id="sidebar-brand">Codex</span>
-          <button id="theme-button" type="button" aria-label="外观" title="外观">🌓</button>
-          <button id="sidebar-refresh" type="button" aria-label="刷新列表">⟳</button>
-          <button id="sidebar-collapse" type="button" aria-label="收起侧边栏" title="收起侧边栏">‹</button>
-          <button id="sidebar-close" type="button" aria-label="关闭会话列表">✕</button>
+          <span class="brand-lockup">
+            <span class="brand-mark"><svg class="icon logo-icon"><use href="#i-logo"></use></svg></span>
+            <span id="sidebar-brand">Codex</span>
+          </span>
+          <div class="sidebar-tools">
+            <button id="theme-button" class="icon-btn" type="button" data-mode="auto" aria-label="外观" title="外观">
+              <svg class="theme-icon" data-for="auto" aria-hidden="true"><use href="#i-auto"></use></svg>
+              <svg class="theme-icon" data-for="light" aria-hidden="true"><use href="#i-sun"></use></svg>
+              <svg class="theme-icon" data-for="dark" aria-hidden="true"><use href="#i-moon"></use></svg>
+            </button>
+            <button id="sidebar-refresh" class="icon-btn" type="button" aria-label="刷新列表" title="刷新列表">
+              <svg class="icon" aria-hidden="true"><use href="#i-refresh"></use></svg>
+            </button>
+            <button id="sidebar-collapse" class="icon-btn" type="button" aria-label="收起侧边栏" title="收起侧边栏">
+              <svg class="icon" aria-hidden="true"><use href="#i-chevron-left"></use></svg>
+            </button>
+            <button id="sidebar-close" class="icon-btn" type="button" aria-label="关闭会话列表" title="关闭">
+              <svg class="icon" aria-hidden="true"><use href="#i-x"></use></svg>
+            </button>
+          </div>
         </div>
+
+        <label id="sidebar-search" for="sidebar-search-input">
+          <svg class="icon search-icon" aria-hidden="true"><use href="#i-search"></use></svg>
+          <input
+            id="sidebar-search-input"
+            type="search"
+            placeholder="搜索会话"
+            autocomplete="off"
+            spellcheck="false"
+            aria-label="搜索会话"
+          />
+          <kbd>⌘K</kbd>
+        </label>
+
         <div id="sidebar-status">
           <span id="status-dot" class="dot"></span>
           <span id="status-text">连接中…</span>
         </div>
+
         <div id="sidebar-actions">
-          <button id="sidebar-new-chat" type="button">＋ 新建对话</button>
-          <button id="sidebar-new-ephemeral" type="button" title="临时对话不会写进历史，关掉就没了">✦ 临时对话</button>
+          <button id="sidebar-new-chat" type="button">
+            <svg class="icon" aria-hidden="true"><use href="#i-plus"></use></svg>
+            <span>新建对话</span>
+          </button>
+          <button id="sidebar-new-ephemeral" class="icon-btn" type="button" title="临时对话不会写进历史，关掉就没了" aria-label="临时对话">
+            <svg class="icon" aria-hidden="true"><use href="#i-sparkle"></use></svg>
+          </button>
         </div>
+
         <div id="project-head">
-          <span>项目</span>
-          <button id="project-add" type="button" aria-label="新建项目" title="新建项目">＋</button>
+          <span class="project-label">
+            <svg class="icon" aria-hidden="true"><use href="#i-folder"></use></svg>
+            <span>项目</span>
+          </span>
+          <button id="project-add" class="icon-btn" type="button" aria-label="新建项目" title="新建项目">
+            <svg class="icon" aria-hidden="true"><use href="#i-plus"></use></svg>
+          </button>
         </div>
         <ul id="thread-list"></ul>
         <p id="list-empty" hidden>没有会话</p>
@@ -63,16 +192,28 @@
 
       <section id="main-pane">
         <header id="topbar">
-          <button id="sidebar-toggle" type="button" aria-label="会话列表">☰</button>
+          <button id="sidebar-toggle" class="icon-btn" type="button" aria-label="会话列表">
+            <svg class="icon" aria-hidden="true"><use href="#i-panel-left"></use></svg>
+          </button>
           <div id="title-area">
             <div id="title">Codex</div>
             <div id="subtitle">连接中…</div>
           </div>
-          <button id="pin-button" type="button" aria-label="置顶会话" hidden>☆</button>
-          <button id="rename-button" type="button" aria-label="重命名会话" hidden>✎</button>
-          <button id="ephemeral-close" type="button" aria-label="结束临时对话" title="结束临时对话" hidden>结束</button>
-          <button id="new-chat-button" type="button" aria-label="新建对话">＋</button>
-          <button id="refresh-button" type="button" aria-label="刷新">⟳</button>
+          <div class="topbar-actions">
+            <button id="pin-button" class="icon-btn" type="button" aria-label="置顶会话" title="置顶会话" hidden>
+              <svg class="icon star-icon" aria-hidden="true"><use href="#i-star"></use></svg>
+            </button>
+            <button id="rename-button" class="icon-btn" type="button" aria-label="重命名会话" title="重命名会话" hidden>
+              <svg class="icon" aria-hidden="true"><use href="#i-pencil"></use></svg>
+            </button>
+            <button id="ephemeral-close" class="text-btn" type="button" aria-label="结束临时对话" title="结束临时对话" hidden>结束</button>
+            <button id="new-chat-button" class="icon-btn" type="button" aria-label="新建对话" title="新建对话">
+              <svg class="icon" aria-hidden="true"><use href="#i-plus"></use></svg>
+            </button>
+            <button id="refresh-button" class="icon-btn" type="button" aria-label="刷新" title="刷新当前会话">
+              <svg class="icon" aria-hidden="true"><use href="#i-refresh"></use></svg>
+            </button>
+          </div>
         </header>
 
         <div id="latency-panel" hidden>
@@ -89,7 +230,7 @@
           <div id="thread-meta"></div>
           <div id="turns"></div>
           <button id="jump-bottom" type="button" aria-label="回到最新消息" title="回到最新消息">
-            <span aria-hidden="true">↓</span>
+            <svg class="icon" aria-hidden="true"><use href="#i-arrow-down"></use></svg>
           </button>
         </div>
 
@@ -97,36 +238,63 @@
           <div id="approval-slot"></div>
           <div id="attach-strip" hidden></div>
           <div id="pending-strip" hidden></div>
-          <div id="composer-tools">
-            <button id="permission-button" type="button" aria-haspopup="true" aria-expanded="false">
-              <span id="permission-dot"></span><span id="permission-text">跟随电脑</span>
-            </button>
-            <button id="composer-latency" type="button" aria-label="连接延时" title="连接延时">
-              <span class="latency-dot" id="composer-latency-dot"></span><span class="latency-icon" id="composer-latency-icon" hidden>⚠</span><span id="composer-latency-text">—</span>
-            </button>
-            <div id="permission-panel" hidden>
-              <div id="permission-head">
-                <span>本对话权限</span>
-                <span id="permission-effective">—</span>
+          <div id="composer-card">
+            <div id="composer-tools">
+              <button id="model-button" type="button" aria-haspopup="dialog" aria-controls="model-panel" aria-expanded="false">
+                <span id="model-text">跟随电脑</span>
+                <svg class="icon chip-chevron" aria-hidden="true"><use href="#i-chevron-down"></use></svg>
+              </button>
+              <button id="permission-button" type="button" aria-haspopup="true" aria-expanded="false">
+                <span id="permission-dot"></span><span id="permission-text">跟随电脑</span>
+              </button>
+              <button id="composer-latency" type="button" aria-label="连接延时" title="连接延时">
+                <span class="latency-dot" id="composer-latency-dot"></span>
+                <svg class="latency-icon icon" id="composer-latency-icon" aria-hidden="true" hidden><use href="#i-warning"></use></svg>
+                <span id="composer-latency-text">—</span>
+              </button>
+
+              <div id="model-panel" role="dialog" aria-label="本对话模型" hidden>
+                <div id="model-head"><span>本对话模型</span><span id="model-effective">—</span></div>
+                <label class="model-field" for="model-select"><span>模型</span><select id="model-select"></select></label>
+                <p id="model-description" class="model-note"></p>
+                <label class="model-field" for="model-effort"><span>思考强度</span><select id="model-effort"></select></label>
+                <p id="model-error" class="model-note" role="status" hidden></p>
+                <div id="model-actions">
+                  <button id="model-retry" type="button" hidden>重新加载模型</button>
+                  <button id="model-apply" type="button">应用</button>
+                </div>
+                <p class="model-note">从下一轮消息开始生效。正在执行的一轮继续使用当前模型。</p>
               </div>
-              <div id="permission-options"></div>
-              <p id="permission-note">
-                改完从下一条消息开始生效。设置跟着会话走，电脑上打开同一个会话也会是同样的权限。
-              </p>
+              <div id="permission-panel" hidden>
+                <div id="permission-head">
+                  <span>本对话权限</span>
+                  <span id="permission-effective">—</span>
+                </div>
+                <div id="permission-options"></div>
+                <p id="permission-note">
+                  改完从下一条消息开始生效。设置跟着会话走，电脑上打开同一个会话也会是同样的权限。
+                </p>
+              </div>
             </div>
-          </div>
-          <div id="composer-row">
-            <button id="attach-button" type="button" aria-label="添加图片">📎</button>
-            <input id="attach-input" type="file" accept="image/*" multiple hidden />
-            <textarea
-              id="message-input"
-              rows="1"
-              placeholder="接着让它做什么…"
-              autocomplete="off"
-              autocapitalize="sentences"
-            ></textarea>
-            <button id="send-button" type="button">发送</button>
-            <button id="stop-button" type="button" hidden>中断</button>
+            <div id="composer-row">
+              <button id="attach-button" class="icon-btn" type="button" aria-label="添加图片" title="添加图片">
+                <svg class="icon" aria-hidden="true"><use href="#i-paperclip"></use></svg>
+              </button>
+              <input id="attach-input" type="file" accept="image/*" multiple hidden />
+              <textarea
+                id="message-input"
+                rows="1"
+                placeholder="接着让它做什么…"
+                autocomplete="off"
+                autocapitalize="sentences"
+              ></textarea>
+              <button id="send-button" type="button" aria-label="发送" title="发送">
+                <svg class="icon" aria-hidden="true"><use href="#i-arrow-up"></use></svg>
+              </button>
+              <button id="stop-button" type="button" aria-label="中断" title="中断当前任务" hidden>
+                <svg class="icon" aria-hidden="true"><use href="#i-stop"></use></svg>
+              </button>
+            </div>
           </div>
         </footer>
       </section>
@@ -134,27 +302,44 @@
 
     <div id="new-chat-modal" hidden>
       <div id="new-chat-card" role="dialog" aria-label="新建对话">
-        <h2 id="new-chat-heading">新建对话</h2>
-        <input
-          id="new-chat-name"
-          type="text"
-          maxlength="120"
-          placeholder="名称，例如：健身饮食"
-          autocomplete="off"
-        />
-        <input
-          id="new-chat-cwd"
-          type="text"
-          placeholder="工作文件夹（留空 = ~/Documents/Codex/chat）"
-          autocomplete="off"
-        />
-        <label id="new-chat-project-row">
+        <div class="modal-heading">
+          <h2 id="new-chat-heading">新建对话</h2>
+          <p>选择工作目录和模型，创建后可以直接开聊。</p>
+        </div>
+        <label class="field" for="new-chat-name">
+          <span>名称</span>
+          <input
+            id="new-chat-name"
+            type="text"
+            maxlength="120"
+            placeholder="例如：健身饮食"
+            autocomplete="off"
+          />
+        </label>
+        <label class="field" for="new-chat-cwd">
+          <span>工作文件夹</span>
+          <input
+            id="new-chat-cwd"
+            type="text"
+            placeholder="留空 = ~/Documents/Codex/chat"
+            autocomplete="off"
+          />
+        </label>
+        <label class="field field-row" id="new-chat-project-row" for="new-chat-project">
           <span>项目</span>
           <select id="new-chat-project"></select>
         </label>
-        <label id="new-chat-permission-row">
+        <label class="field field-row" id="new-chat-permission-row" for="new-chat-permission">
           <span>权限</span>
           <select id="new-chat-permission"></select>
+        </label>
+        <label class="field field-row" for="new-chat-model">
+          <span>模型</span>
+          <select id="new-chat-model"></select>
+        </label>
+        <label class="field field-row" for="new-chat-effort">
+          <span>思考强度</span>
+          <select id="new-chat-effort"></select>
         </label>
         <label id="new-chat-pin-row">
           <input id="new-chat-pin" type="checkbox" />
@@ -162,7 +347,7 @@
         </label>
         <div id="new-chat-actions">
           <button id="new-chat-cancel" type="button">取消</button>
-          <button id="new-chat-create" type="button">创建</button>
+          <button id="new-chat-create" type="button">创建对话</button>
         </div>
       </div>
     </div>
@@ -170,22 +355,32 @@
     <div id="toast" hidden></div>
     <div id="new-project-modal" hidden>
       <div id="new-project-card" role="dialog" aria-label="新建项目">
-        <h2>新建项目</h2>
-        <input id="new-project-name" type="text" maxlength="120" placeholder="项目名称，例如：RemoteCodex" autocomplete="off" />
-        <input
-          id="new-project-path"
-          type="text"
-          placeholder="项目文件夹（绝对路径，例如 ~/Documents/Project/foo）"
-          autocomplete="off"
-          list="cwd-options"
-        />
+        <div class="modal-heading">
+          <h2>新建项目</h2>
+          <p>项目用来把同一目录下的会话收在一起。</p>
+        </div>
+        <label class="field" for="new-project-name">
+          <span>名称</span>
+          <input id="new-project-name" type="text" maxlength="120" placeholder="例如：RemoteCodex" autocomplete="off" />
+        </label>
+        <label class="field" for="new-project-path">
+          <span>项目文件夹</span>
+          <input
+            id="new-project-path"
+            type="text"
+            placeholder="绝对路径，例如 ~/Documents/Project/foo"
+            autocomplete="off"
+            list="cwd-options"
+          />
+        </label>
         <datalist id="cwd-options"></datalist>
         <div id="new-project-actions">
           <button id="new-project-cancel" type="button">取消</button>
-          <button id="new-project-create" type="button">创建</button>
+          <button id="new-project-create" type="button">创建项目</button>
         </div>
       </div>
     </div>
+    <script src="/chat-view.js"></script>
     <script src="/app.js"></script>
   </body>
 </html>
