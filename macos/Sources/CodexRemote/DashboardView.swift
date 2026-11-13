@@ -347,6 +347,20 @@ struct DashboardView: View {
                 tint: model.daemonConnected ? .green : .orange
             )
             StatTile(
+                icon: "gauge.with.dots.needle.50percent",
+                title: "Codex 额度 · 已用",
+                value: model.codexLimitText,
+                detail: model.codexLimitDetail,
+                tint: codexLimitTint
+            )
+            StatTile(
+                icon: "chart.bar.xaxis",
+                title: "CC Switch · 今日",
+                value: model.ccSwitchUsageText,
+                detail: model.ccSwitchUsageDetail,
+                tint: model.ccSwitchUsageAvailable ? .indigo : .secondary
+            )
+            StatTile(
                 icon: "iphone.radio",
                 title: "实时连接",
                 value: model.clientCountText,
@@ -368,6 +382,14 @@ struct DashboardView: View {
                 tint: .secondary
             )
         }
+    }
+
+    private var codexLimitTint: Color {
+        guard model.codexLimitAvailable else { return .secondary }
+        let used = model.codexLimitUsedPercent ?? 0
+        if used >= 90 { return .red }
+        if used >= 70 { return .orange }
+        return .green
     }
 
     // MARK: - Details

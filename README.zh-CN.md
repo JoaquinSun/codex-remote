@@ -8,13 +8,14 @@
 
 这是 [JoaquinSun 维护的 fork](https://github.com/JoaquinSun/codex-remote)，上游为
 [KotChiu/codex-remote](https://github.com/KotChiu/codex-remote)。保留原项目的桥接实现和 Git 历史，
-新增 macOS 原生管理客户端、按会话切换模型、执行过程折叠和新版浏览器界面。本项目由社区维护，与 OpenAI 无隶属关系。
+新增 macOS 原生管理客户端、按会话切换模型、执行过程折叠、Codex / CC Switch 用量概览和新版浏览器界面。
+本项目由社区维护，与 OpenAI 无隶属关系。
 
 ## 下载 macOS App
 
 在 [Releases](https://github.com/JoaquinSun/codex-remote/releases/latest) 下载 **Codex Remote Server**。
 
-- 需要 **Apple Silicon（M 系列）Mac、macOS 14 或更高版本**、已安装并登录的 Codex 桌面 App，
+- 需要 **Apple Silicon（M 系列）Mac、macOS 14 或更高版本**、已安装并登录且可使用 Codex 的 ChatGPT 桌面 App，
   以及 Node.js 18 或更高版本（也可以使用 Codex 自带的 Node 运行时）。
 - 解压 ZIP，将 `Codex Remote Server.app` 放进「应用程序」后打开。App 已包含桥接代码，
   Node.js 从本机自动检测，下载包里不另带 Node.js。
@@ -31,23 +32,27 @@ App 与源码发行版不包含本机令牌、日志、会话抓取、真实会�
 
 ## 核心思路
 
-不另起一个 agent，而是接上**桌面 App 已经在用的那个 app-server daemon**
-（`~/.codex/app-server-control/app-server-control.sock`）。所以手机看到的会话、
-线程、状态就是电脑上那一份，在手机上发一条消息，桌面上同一个会话会继续往下跑。
+普通持久化聊天的**发送、引导、中断和审批直接交给 ChatGPT 桌面 App 中的 Codex**，
+通过 `~/.codex/ipc/ipc.sock` 找到聊天所属的桌面窗口并调用它的 follower 接口。
+写入权始终留在桌面 App。首次操作尚未由桌面接入的聊天时，桥接通过系统链接在 ChatGPT 中打开它。
 
 ```
-手机浏览器  ──HTTP/SSE──▶  bridge (本仓库)  ──WebSocket over Unix socket──▶  codex app-server daemon
+手机浏览器 ──HTTP/SSE──▶ bridge ──桌面 IPC──▶ ChatGPT 中的 Codex
+                            └──app-server 数据接口──▶ 项目、历史、模型目录、额度、新聊天建档
 ```
 
-- 复用 Codex 桌面 App 的 daemon 和 `~/.codex`，不需要额外装东西。
-- 协议就是官方的 app-server JSON-RPC 2.0，没有私改。
+- ChatGPT 已连接但默认数据 socket 缺失或拒绝连接时，桥接使用 ChatGPT 自带的 Codex 执行 `app-server daemon start`，恢复共享的本地数据服务。普通聊天的任务执行仍交给桌面 App。
+- 默认数据 socket 为 `$CODEX_HOME/app-server-control/app-server-control.sock`，`CODEX_HOME` 默认为 `~/.codex`。显式指定 `--socket` 时不自动启动数据服务，也可用 `--no-auto-start-daemon` 关闭自动恢复。
+  这个后台不一定与 ChatGPT 的内置后台是同一个进程。新聊天只在这里建档并释放写锁，正式运行交给桌面 App。
+- 桌面 IPC 是内部协议，已验证 ChatGPT 26.1111.21308 的状态协议 13，并保留状态协议 11 的支持；其他未验证的协议版本会明确报错。
+  临时对话没有可供桌面恢复的持久化记录，仍使用数据接口的内存会话，与桌面聊天分开。
 - 桥接层零依赖（只用 Node 内置模块），WebSocket-over-Unix-socket 是手写的。
 
 ## 安装
 
 前置条件：
 
-- macOS，且已经装好并登录过 **Codex 桌面 App**（桥接的是它已经在跑的那个 daemon）。
+- macOS，且已经装好并登录过 **ChatGPT 桌面 App**，Codex 和已有的聊天数据接口可用。
 - Node.js：优先用 PATH 里的 `node`；没有就回退到 Codex 自带运行时，也可以用
   `CODEX_REMOTE_NODE=/path/to/node` 指定。**零依赖，不需要 `npm install`。**
 
@@ -126,15 +131,33 @@ token 保存在 `~/.codex-remote/token`（权限 600）。
 界面上能做的事：
 
 - 侧边栏会话列表：名称、预览、运行状态（运行中 / 待审批）、相对时间；当前会话高亮。
-- **会话详情**：用户消息和 Agent 回复（Markdown）保留在主要聊天流中；进度说明、思考、命令、工具调用和文件
-  改动收进默认折叠的「执行过程」。运行时摘要显示最新进度和当前活动，结束后显示执行次数、文件数量、工具
-  数量和失败步骤。点开仍能查看命令、退出码、输出、思考、差异与计划。详细内容按需渲染，实时更新和轮询
-  会保留已展开的区域。旧版模型不带消息 `phase` 也会保留最终回复；引导消息和阶段性回答按原顺序显示。
+- **会话详情**：用户消息、Agent 回复（Markdown）、进度说明、思考文字和计划直接显示在主要聊天流中，保留
+  消息原顺序。连续的命令、工具调用和文件改动收进默认折叠的「执行过程」，摘要显示当前活动、执行次数、
+  文件数量、工具数量和失败步骤。运行中的工具也保持折叠，点开后可查看命令、退出码、输出和差异。详细
+  内容按需渲染，实时更新和轮询会保留已展开的区域。旧版模型不带消息 `phase` 时也会保留全部文字。
+- **拖入图片**：打开一条对话后，可以把一张或多张图片直接拖到网页中；输入框会显示拖入提示，松开后
+  显示附件预览，可逐张移除。每条消息最多 6 张，多次拖入和文件选择共用这个上限。切换对话会取消
+  仍在读取的图片。
 - **按会话切换模型**：输入框上方的模型按钮可选择模型与思考强度，选项来自当前 Codex daemon 的 `model/list`。
   桥接会验证模型支持的强度，并把每个会话的选择存在 `~/.codex-remote/models.json`，刷新页面或用同一桥接的
-  其他浏览器打开仍会保留。设置从下一轮消息开始生效，电脑占用时的 `codex queue` 排队路径也会带上；「引导」
-  保持当前轮的模型。「跟随电脑」清除桥接覆盖，面板单独显示当前实际使用的模型。新建对话时也可以选模型，
+  其他浏览器打开仍会保留。设置对下一次由桥接启动的新一轮生效；排队消息沿用桌面会话的现有设置，手机选择
+  继续保存，供后续由桥接启动的新一轮使用。「引导」保持当前轮的模型。「跟随电脑」清除桥接覆盖，面板单独
+  显示当前实际使用的模型。新建对话时也可以选模型，
   临时对话的选择只存在内存中。模型列表描述可选项，实际推理访问仍由所用服务决定。
+- **正在工作的项目**：左栏的「正在工作」区域显示项目名称、进行中的任务数和待审批数，点击可进入对应
+  的工作会话。任务开始、完成或中断时会自动更新；项目分组折叠后仍显示进行中标记。项目分组和工作项目
+  入口保持项目目录顺序，不随会话活动重新排序，两个列表刷新时都会保留滚动位置。
+  会话按项目 ID 或最具体的项目根目录归属，未登记的工作目录按文件夹名显示；较早的运行会话
+  会从分页列表补入，避免只看到最近 40 个会话里的项目。
+- **Codex 与 CC Switch 用量概览**：点浏览器标题栏的仪表图标，可以看到 Codex 返回的所有 Usage limit
+  窗口，包括已用 / 剩余比例、重置时间、套餐和可用的额度重置次数。桥接走官方 app-server 的
+  `account/rateLimits/read`，收到 `account/rateLimits/updated` 会立即失效重读，平时缓存 30 秒，面板展开时每
+  30 秒自动刷新。同一面板还会
+  显示 **CC Switch · 今日**的真实 Token、请求数、已记录的估算成本和各 App 分项；数据通过系统 `sqlite3`
+  只读查询 `~/.cc-switch/cc-switch.db`，按 CC Switch 当前的 fresh input 归一化和 session/proxy 去重规则汇总。
+  macOS 原生面板也有两张紧凑统计卡片。经过已认证桥接的只有聚合数字；API Key、服务商或账号详情、数据库
+  路径、请求与响应正文都不会返回。Codex app-server 太旧、未安装 CC Switch、数据库不存在或系统缺少
+  `sqlite3` 时只显示不可用，不影响其他功能。
 - 底部输入框继续发指令；任务运行时可以「中断」。
 - **未读小圆点**：某个会话跑完一轮时你没在看它（或者页面在后台），列表里它名字前面会出现一个蓝色小圆点，
   点开这个会话就自动清掉。状态存在浏览器 `localStorage`（`codex.unread`），刷新页面也还在。
@@ -142,21 +165,21 @@ token 保存在 `~/.codex-remote/token`（权限 600）。
   `● 运行中 1:23`（脉冲圆点 + 走动的计时）。基准取服务端的 `turn.startedAt`（拿不到就用
   第一次看到它开始跑的时刻兜底），格式 `0:12` / `1:23` / `1:02:03`；一秒一跳、只改那一个
   文本节点，页面在后台就不动。
-- **接管电脑上正在跑的会话**：桌面端在跑某一轮时，计时旁边会出现「接管」。点它会把自己加入
-  同一个 thread —— 不需要关掉电脑上的会话，也不需要让 Codex 失焦；之后「中断」和「引导」都
-  直接作用于这一轮。手机会每 2 秒回读最近一轮，把新输出和工具调用补进来；这一轮跑完后，桥接
-  会把写锁还给桌面端，不会一直占着。
+- **连接电脑上正在跑的会话**：手机通过桌面 IPC 订阅同一聊天的状态和审批，
+  「中断」和「引导」由持有聊天的 ChatGPT 窗口执行，不再把运行任务接管到独立后台。
+  手机仍每 2 秒回读最近一轮，把新输出和工具调用补进来。
 - **运行中发消息 = 先挂起来，不打断**（对齐桌面版）：会话正在跑的时候按「发送」，消息不会打断
   当前这一轮，而是浮在输入框上方等着（`待发` + 消息 + 「引导」/「✕」），这一轮跑完自动作为新
   一轮发出去；中途切到别的会话、甚至关掉页面再打开（待发列表存在 `localStorage`）都还等着。
-  想让它立刻插进正在跑的那一轮，点那条上的「引导」—— 走 daemon 原生的 `turn/steer`，不新开一轮。
+  想让它立刻插进正在跑的那一轮，点那条上的「引导」—— 交给 ChatGPT 当前聊天处理，不新开一轮。
   挂起来和引导都**不弹悬浮提示**（输入框上方那条、以及引导后立刻插回会话里的那条消息就是回执）；
-  只有真被 daemon 排队（`codex queue`）时，消息下面会多一行「排队中 · 电脑端这一轮跑完就执行」。
+  只有真被 daemon 排队时，消息下面会多一行「排队中 · 等待桌面端接收」。
   输入框旁边始终只有「发送」和运行中的「中断」两个按钮。被中断的那一轮 daemon 不一定发
   `turn/completed`，所以桥接和页面每次读会话都拿服务端的 turn 状态校准一次，免得假「运行中」
   把待发消息卡住。
-- **会话被电脑端占用时自动排队**：如果消息发出去时发现那个会话被电脑端占着
-  （`already has an active writer`），会退回 `codex queue` 排队，等当前这轮跑完自动执行。
+- **向桌面聊天投递**：消息和图片通过桌面 follower 接口发送，模型与权限选择先由桌面确认，
+  再启动新一轮。引导沿用当前轮次的设置。没有桌面回执时会提示刷新确认结果，不会换路径重复提交。
+  兼容的数据队列接口不受支持时直接提示更新，不会执行命令行工具。
 - **审批卡片**：Codex 请求执行命令/改文件时，手机上出现「允许 / 本会话都允许 / 拒绝 / 拒绝并中断」。
 - **新建对话 / 重命名 / 置顶**：标题栏点 ＋ 新建（默认建在 `~/Documents/Codex/chat`；默认不置顶，需要时勾选「置顶显示」），
   ✎ 重命名，☆/★ 置顶。置顶的会话排在最前面并带 ★，方便做成「固定窗口」（例如「健身饮食」）。
@@ -185,7 +208,7 @@ token 保存在 `~/.codex-remote/token`（权限 600）。
     所以桥接层自己按序缓存它的事件（上限 4000 条），前端重开时回放 —— 刷新页面照样能看到
     完整对话，包括你自己的消息（daemon 在 `turn/completed` 里只回摘要，回放时以 `item/*`
     事件为准）。
-  - 临时会话不能排队（没有 rollout 供 `codex queue` 使用），它正在跑的时候再发会提示等一等。
+  - 临时会话不支持持久化输入队列，它正在跑的时候再发会提示等一等。
 - **每个会话的权限档位**：输入框左上角那个小圆点，点开有四个选择，新建对话时也能直接选。
   档位跟着会话走（存在桥接这边 `~/.codex-remote/permissions.json`），电脑上打开同一个会话
   也会是同样的权限，所以手机上放开了、回到电脑不会偷偷降级。
@@ -193,13 +216,13 @@ token 保存在 `~/.codex-remote/token`（权限 600）。
   | 档位 | 含义 | 对应 Codex 的 |
   | --- | --- | --- |
   | 跟随电脑 | 不下发任何覆盖，用电脑上这个会话现在的设置 | 默认 |
-  | 自己决策 | 工作区内自由跑，要越界 / 联网时弹卡片问你 | `-s workspace-write` + `on-request` |
-  | 帮我决策 | 越界请求交给 Codex 的审查子代理判断，不打扰你 | `--approve-for-me` |
-  | 完全访问 | 不询问、不沙箱，任何命令直接跑 | `--dangerously-bypass-approvals-and-sandbox` |
+  | 自己决策 | 工作区内自由跑，要越界 / 联网时弹卡片问你 | `workspaceWrite` + `on-request` |
+  | 帮我决策 | 越界请求交给 Codex 的审查子代理判断，不打扰你 | `approvalsReviewer: auto_review` |
+  | 完全访问 | 不询问、不沙箱，任何命令直接跑 | `dangerFullAccess` + `never` |
 
-  实现在下一条消息上：发消息时桥接会把档位同时带在 `thread/resume` 和 `turn/start` 上；
-  会话正被电脑占用、只能排队时，则翻译成 `codex queue` 的参数。
-  弹层右上角会显示**电脑上实际生效**的设置（来自 daemon 的 `thread/settings/updated`），
+  对下一轮生效：普通聊天先由 ChatGPT 确认模型与权限设置，再由桌面窗口启动；引导沿用正在运行的设置。
+  临时对话通过数据接口在 `turn/start` 中应用档位。
+  弹层右上角会显示**电脑上实际生效**的设置（来自桌面状态订阅或数据接口），
   刚改完还没发消息时显示 `—` 是正常的。
 - **白天 / 夜间配色**：默认跟随手机系统，侧边栏顶部那个 `🌓` 按钮点一下循环
   `跟随手机 → ☀️ 白天 → 🌙 夜间`，记在 `localStorage` 的 `codex.theme` 里。
@@ -282,8 +305,8 @@ token 保存在 `~/.codex-remote/token`（权限 600）。
 
 ## 前置条件
 
-- 桌面 App（或 `codex app-server daemon start`）在运行，控制 socket 存在。
-  `bin/codex-remote` 启动前会自动尝试 `codex app-server daemon start`。
+- ChatGPT 桌面 App 已打开，桌面 IPC 和配置的 app-server 数据 socket 均可连接。
+  默认本地数据服务不可用时，桥接会恢复它，会话历史、项目和模型目录请求会等待连接就绪。显式指定 `--socket` 时连接操作者配置的已有数据服务。
 - Node.js：优先用 PATH 里的 `node`，否则回退到 Codex 自带的运行时。
   也可以用 `CODEX_REMOTE_NODE=/path/to/node` 指定。
 
@@ -294,6 +317,7 @@ token 保存在 `~/.codex-remote/token`（权限 600）。
 | `--port` | `8787` | 监听端口 |
 | `--host` | `0.0.0.0` | 监听地址；只想本机用就设 `127.0.0.1` |
 | `--socket` | `~/.codex/app-server-control/app-server-control.sock` | app-server 控制 socket |
+| `--no-auto-start-daemon` | 关闭 | 禁用默认共享数据服务的自动恢复 |
 | `--token-file` | `~/.codex-remote/token` | token 文件；删掉会重新生成 |
 | `--name` | 主机名 | 页面/标签页显示的名字，用来区分多台电脑 |
 | `--name-file` | `~/.codex-remote/name` | 名字的持久化文件，也可以直接用环境变量 `CODEX_REMOTE_NAME` |
@@ -311,17 +335,18 @@ token 保存在 `~/.codex-remote/token`（权限 600）。
 
 | 现象 | 原因 / 处理 |
 | --- | --- |
-| 页面提示「未连接」 | daemon 没跑：`codex app-server daemon start` |
+| 页面提示「未连接」 | 打开 ChatGPT，默认数据服务会自动恢复。显式指定 `--socket` 时检查自定义数据服务；可用 `CODEX_REMOTE_CODEX` 指定恢复服务所用的 Codex 程序。 |
+| 提示 ChatGPT 未连接或协议不兼容 | 打开桌面 App 中的 Codex；桌面升级后可能需要更新桥接的内部 IPC 适配 |
 | 手机打不开 | 不在同一网段、Mac 的防火墙、或 `--host` 设成了 `127.0.0.1` |
 | 401 unauthorized | 用带 `?token=` 的完整地址重新打开一次 |
 | 想换 token | 删除 `~/.codex-remote/token` 后重启服务 |
-| 发消息提示「已排队」 | 正常：该会话正在电脑上运行，消息排在后面自动执行 |
+| 发消息提示「已排队」 | 会话的消息投递仍由桌面端持有，消息正在等待桌面端接收 |
 | 发的消息落到回答下面 / 回答跑到消息上面 | 以前会把「还没被 daemon 记进会话」的那条回显贴到整个对话流末尾，看起来就像回答在前面。现在回显按归属插回自己那一轮的原位：运行中点「引导」、或消息插进正在跑的那一轮（daemon 要到下一个模型回合才把它记成一条记录，实测十几秒到几十秒）时，消息会停在发送时刻的位置，后续输出接在它下面 |
 | 点了回复里的链接没反应 | 页面自己接管了链接点击（新标签打开）；若是内嵌浏览器把新标签也拦了，长按链接复制地址到浏览器里开 |
 | 提示「no rollout found」 | 会话 id 不存在（多为列表过期），回列表刷新即可 |
 | 延时一直 200ms 以上 | 多半是手机走了 Tailscale 中继而不是局域网：点延时按钮看「接入路径」，用面板里的局域网链接重开一次 |
 | Tailscale 显示中继 | `tailscale netcheck` 看 `UDP`、`MappingVariesByDestIP`、`PortMapping`；`tailscale ping <对端IP>` 看是 `via <ip>:port` 还是 `via DERP(...)`。两端放行 UDP 41641、路由器开 UPnP/NAT-PMP；硬 NAT 无法打洞时，用 Tailscale ≥ 1.86 把国内低延迟 VPS 配成 Peer Relay |
-| 手机上设了权限档位但还在弹审批 | 档位只对「下一条消息」生效；若那个会话正被电脑占用，`thread/resume` 会被 `active writer` 挡掉，档位下发不进去，等这轮跑完再发 |
+| 手机上设了权限档位但还在弹审批 | 设置对下一轮生效，运行中的引导沿用该轮原有设置；普通聊天须先得到 ChatGPT 的设置确认才发送 |
 
 ### Tailscale 提速
 
@@ -336,7 +361,7 @@ token 保存在 `~/.codex-remote/token`（权限 600）。
 bin/codex-remote            启动脚本
 src/ws-unix.js              WebSocket over Unix socket 客户端（零依赖实现）
 src/appserver.js            app-server JSON-RPC 2.0 客户端
-src/codex-cli.js            codex CLI 定位 + 排队投递（占用时兜底）
+src/desktop.js              ChatGPT 桌面 IPC、聊天控制、状态与审批订阅
 src/permissions.js          会话权限档位定义与落盘
 src/models.js               模型列表校验、会话模型选择与 RPC 参数
 src/server.js               HTTP + SSE 桥接，鉴权，审批转发
@@ -344,6 +369,7 @@ public/chat-view.js          消息与执行过程分组、活动摘要
 public/                     手机端界面
 launchd/                    常驻服务模板
 scripts/probe.js            连通性探针，直接列会话
+scripts/probe-desktop.js    只读探测 ChatGPT 桌面 IPC、聊天归属和审批状态订阅
 scripts/install-launchd.sh  安装常驻服务
 ```
 

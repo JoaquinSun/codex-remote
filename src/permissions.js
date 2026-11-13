@@ -6,8 +6,8 @@ const path = require('node:path');
 /* 会话权限档位，直接用 Codex 自己的概念：
    - ask  自己决策：工作区内自由执行，需要越界（沙箱逃逸 / 联网 / MCP 询问）时弹卡片问你。
    - auto 帮我决策：同样在工作区里跑，但越界请求交给 Codex 的审查子代理判断，
-          不再打扰你（等价于 `codex queue --approve-for-me`）。
-   - full 完全访问：不沙箱、不询问（等价于 `--dangerously-bypass-approvals-and-sandbox`）。
+          不再打扰你（approvalsReviewer = auto_review）。
+   - full 完全访问：不沙箱、不询问（dangerFullAccess / never）。
    没设置过（default）就不下发任何覆盖，完全跟随电脑上那份设置。 */
 const PROFILES = {
   ask: {
@@ -92,21 +92,6 @@ function turnParams(mode) {
   };
 }
 
-/* 会话正在电脑上跑、只能排队时走 `codex queue`，把档位翻译成 CLI 参数；
-   没设置过就沿用原来的行为（由 CODEX_REMOTE_SANDBOX 决定）。 */
-function queueArgs(mode) {
-  switch (mode) {
-    case 'ask':
-      return ['--sandbox', PROFILES.ask.sandbox];
-    case 'auto':
-      return ['--approve-for-me'];
-    case 'full':
-      return ['--dangerously-bypass-approvals-and-sandbox'];
-    default:
-      return null;
-  }
-}
-
 const SANDBOX_LABELS = {
   'read-only': '只读',
   'workspace-write': '工作区可写',
@@ -174,7 +159,6 @@ module.exports = {
   profileList,
   threadParams,
   turnParams,
-  queueArgs,
   sandboxLabel,
   reviewerLabel,
   modeFromSettings,

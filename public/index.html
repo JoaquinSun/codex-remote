@@ -119,6 +119,12 @@
         <symbol id="i-command" viewBox="0 0 24 24">
           <path d="M9 9h6v6H9zM9 9H7.2A2.2 2.2 0 1 1 9.4 6.8V9Zm5.6-2.2A2.2 2.2 0 1 1 16.8 9H15V6.8ZM9 15v2.2a2.2 2.2 0 1 1-2.2-2.2H9Zm6 0h2.2a2.2 2.2 0 1 1-2.2 2.2V15Z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" />
         </symbol>
+        <symbol id="i-usage" viewBox="0 0 24 24">
+          <path d="M4.2 17.8a8.8 8.8 0 1 1 15.6 0" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" />
+          <path d="m12 12 4.4-3.2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
+          <circle cx="12" cy="12" r="1.5" fill="currentColor" />
+          <path d="M6.2 18.2h11.6" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" />
+        </symbol>
       </defs>
     </svg>
 
@@ -175,6 +181,18 @@
           </button>
         </div>
 
+        <section id="working-projects" aria-labelledby="working-projects-title">
+          <div id="working-projects-head">
+            <span class="project-label">
+              <span class="working-dot" aria-hidden="true"></span>
+              <span id="working-projects-title">正在工作</span>
+            </span>
+            <span id="working-projects-count" aria-label="工作中的项目数">0</span>
+          </div>
+          <ul id="working-projects-list"></ul>
+          <p id="working-projects-empty">正在读取工作项目…</p>
+        </section>
+
         <div id="project-head">
           <span class="project-label">
             <svg class="icon" aria-hidden="true"><use href="#i-folder"></use></svg>
@@ -210,6 +228,9 @@
             <button id="new-chat-button" class="icon-btn" type="button" aria-label="新建对话" title="新建对话">
               <svg class="icon" aria-hidden="true"><use href="#i-plus"></use></svg>
             </button>
+            <button id="usage-button" class="icon-btn" type="button" aria-label="用量概览" title="Codex 额度与 CC Switch 用量" aria-haspopup="dialog" aria-controls="usage-panel" aria-expanded="false">
+              <svg class="icon" aria-hidden="true"><use href="#i-usage"></use></svg>
+            </button>
             <button id="refresh-button" class="icon-btn" type="button" aria-label="刷新" title="刷新当前会话">
               <svg class="icon" aria-hidden="true"><use href="#i-refresh"></use></svg>
             </button>
@@ -226,6 +247,37 @@
           <p id="latency-hint" hidden></p>
         </div>
 
+        <div id="usage-panel" role="dialog" aria-label="用量概览" hidden>
+          <div id="usage-head">
+            <div>
+              <strong>用量概览</strong>
+              <span id="usage-checked">—</span>
+            </div>
+            <button id="usage-refresh" class="icon-btn" type="button" aria-label="刷新用量" title="刷新用量">
+              <svg class="icon" aria-hidden="true"><use href="#i-refresh"></use></svg>
+            </button>
+          </div>
+          <section class="usage-section" aria-labelledby="usage-codex-title">
+            <div class="usage-section-head">
+              <span id="usage-codex-title">Codex Usage limit</span>
+              <span id="usage-plan"></span>
+            </div>
+            <div id="usage-codex-body" class="usage-section-body">
+              <p class="usage-empty">正在读取…</p>
+            </div>
+          </section>
+          <section class="usage-section" aria-labelledby="usage-cc-title">
+            <div class="usage-section-head">
+              <span id="usage-cc-title">CC Switch · 今日</span>
+              <span>本机只读</span>
+            </div>
+            <div id="usage-cc-body" class="usage-section-body">
+              <p class="usage-empty">正在读取…</p>
+            </div>
+          </section>
+          <p id="usage-error" hidden></p>
+        </div>
+
         <div id="thread-view">
           <div id="thread-meta"></div>
           <div id="turns"></div>
@@ -239,6 +291,10 @@
           <div id="attach-strip" hidden></div>
           <div id="pending-strip" hidden></div>
           <div id="composer-card">
+            <div id="image-drop-hint" role="status" aria-live="polite" hidden>
+              <strong>松开即可添加图片</strong>
+              <span>一次最多 6 张，添加后可预览和移除</span>
+            </div>
             <div id="composer-tools">
               <button id="model-button" type="button" aria-haspopup="dialog" aria-controls="model-panel" aria-expanded="false">
                 <span id="model-text">跟随电脑</span>
@@ -277,7 +333,7 @@
               </div>
             </div>
             <div id="composer-row">
-              <button id="attach-button" class="icon-btn" type="button" aria-label="添加图片" title="添加图片">
+              <button id="attach-button" class="icon-btn" type="button" aria-label="添加图片" title="添加图片，也可直接拖入网页">
                 <svg class="icon" aria-hidden="true"><use href="#i-paperclip"></use></svg>
               </button>
               <input id="attach-input" type="file" accept="image/*" multiple hidden />
@@ -381,6 +437,8 @@
       </div>
     </div>
     <script src="/chat-view.js"></script>
+    <script src="/project-view.js"></script>
+    <script src="/image-drop.js"></script>
     <script src="/app.js"></script>
   </body>
 </html>

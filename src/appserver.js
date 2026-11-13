@@ -132,4 +132,16 @@ class AppServerConnection extends EventEmitter {
   }
 }
 
-module.exports = { AppServerConnection };
+function isBusyThreadError(error) {
+  return Boolean(error && /active writer|already running/i.test(error.message || ''));
+}
+
+function isThreadNotFoundError(error) {
+  return Boolean(error && /thread not found/i.test(error.message || ''));
+}
+
+function isFreshThreadError(error) {
+  return Boolean(error && /no rollout found|list_turns is not supported/i.test(error.message || ''));
+}
+
+module.exports = { AppServerConnection, isBusyThreadError, isThreadNotFoundError, isFreshThreadError };

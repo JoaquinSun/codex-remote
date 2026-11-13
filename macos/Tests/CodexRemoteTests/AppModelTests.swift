@@ -46,6 +46,26 @@ private final class StubServer: @unchecked Sendable {
             ]
             if reportsListener { meta["listenHost"] = host }
             body = meta
+        } else if request.url?.path == "/api/usage" {
+            body = [
+                "fetchedAt": Date().timeIntervalSince1970 * 1000,
+                "codex": [
+                    "available": true,
+                    "limits": [[
+                        "limitId": "codex", "planType": "pro",
+                        "primary": ["usedPercent": 24, "windowDurationMins": 300],
+                        "secondary": ["usedPercent": 11, "windowDurationMins": 10_080],
+                    ]],
+                ],
+                "ccSwitch": [
+                    "available": true,
+                    "period": "today",
+                    "summary": [
+                        "requests": 204, "realTotalTokens": 25_220_000,
+                        "totalCostUsd": 9.9,
+                    ],
+                ],
+            ]
         } else {
             body = ["ok": true, "connected": true, "clients": 0, "serverMs": 1]
         }
@@ -188,6 +208,27 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(model.endpoints.map(\.kind), [.local])
         XCTAssertEqual(URL(string: try XCTUnwrap(model.primaryURLString))?.host, "127.0.0.1")
         XCTAssertTrue(model.hostLabel.contains("127.0.0.1"))
+    }
+
+    func testUsageSnapshotPopulatesCodexAndCCSwitchTiles() async throws {
+        let (model, _, _) = try fixture()
+        await model.startServer()
+        await model.refreshUsageNow()
+
+        XCTAssertEqual(model.codexLimitText, "24% · 11%")
+        XCTAssertTrue(model.codexLimitDetail.contains("5 小时"))
+        XCTAssertTrue(model.codexLimitDetail.contains("7 天"))
+        XCTAssertTrue(model.codexLimitAvailable)
+        XCTAssertEqual(model.codexLimitUsedPercent, 24)
+        XCTAssertEqual(model.ccSwitchUsageText, "2522 万 Token")
+        XCTAssertEqual(model.ccSwitchUsageDetail, "今日 · 204 次 · $9.90")
+        XCTAssertTrue(model.ccSwitchUsageAvailable)
+
+        await model.stopServer()
+        XCTAssertFalse(model.codexLimitAvailable)
+        XCTAssertEqual(model.codexLimitText, "—")
+        XCTAssertFalse(model.ccSwitchUsageAvailable)
+        XCTAssertEqual(model.ccSwitchUsageText, "—")
     }
 
     func testLANToLoopbackChangeKeepsLiveURLsUntilRestart() async throws {

@@ -9,13 +9,13 @@ Pick up the Codex session running on your desktop from your phone: read the hist
 This is [JoaquinSun's fork](https://github.com/JoaquinSun/codex-remote) of
 [KotChiu/codex-remote](https://github.com/KotChiu/codex-remote). The original bridge and its Git history are
 preserved. This fork adds a native macOS companion, per-session model selection, folded execution history,
-and an updated browser UI. It is a community project, unaffiliated with OpenAI.
+Codex / CC Switch usage at a glance, and an updated browser UI. It is a community project, unaffiliated with OpenAI.
 
 ## Download the macOS app
 
 Get **Codex Remote Server** from [Releases](https://github.com/JoaquinSun/codex-remote/releases/latest).
 
-- Requires **macOS 14 or later on Apple Silicon** (M-series), the Codex desktop app installed and signed in,
+- Requires **macOS 14 or later on Apple Silicon** (M-series), the ChatGPT desktop app installed and signed in with Codex available,
   and Node.js 18 or later (or the Node runtime included with Codex).
 - Extract the ZIP, move `Codex Remote Server.app` to Applications, and launch it. The bridge code is included;
   Node.js is detected on the Mac rather than bundled into the download.
@@ -36,23 +36,28 @@ Build it locally with `bash scripts/build-macos.sh`; outputs go into `macos/buil
 
 ## How it works
 
-Rather than spawning another agent, the bridge attaches to **the same app-server daemon the desktop app is already using**
-(`~/.codex/app-server-control/app-server-control.sock`). The sessions, threads and statuses you see on the phone are the
-same ones on the computer; send a message from the phone and that very session keeps running on the desktop.
+For persistent conversations, **sending, steering, interruption, and approvals run inside Codex in the ChatGPT desktop app**.
+The bridge discovers the owning desktop window through `~/.codex/ipc/ipc.sock` and uses its follower protocol.
+The desktop keeps the writer lock. When a conversation has no desktop owner, the bridge opens it in ChatGPT through a system link.
 
 ```
-phone browser  ──HTTP/SSE──▶  bridge (this repo)  ──WebSocket over Unix socket──▶  codex app-server daemon
+phone browser ──HTTP/SSE──▶ bridge ──desktop IPC──▶ Codex in ChatGPT
+                             └──app-server data API──▶ projects, history, models, quota, new-chat metadata
 ```
 
-- Reuses the Codex desktop app's daemon and `~/.codex`; nothing extra to install.
-- Speaks the official app-server JSON-RPC 2.0 protocol, unmodified.
+- When ChatGPT is connected and the default data socket is missing or refuses connections, the bridge uses ChatGPT's bundled Codex to run `app-server daemon start`. This restores the shared local data service; persistent chat execution stays in the desktop app.
+- The default data socket is `$CODEX_HOME/app-server-control/app-server-control.sock`, with `CODEX_HOME` defaulting to `~/.codex`. An explicit `--socket` disables automatic daemon startup; `--no-auto-start-daemon` also disables it.
+  Its server can be a different process from ChatGPT's embedded backend. New conversations are created there as metadata,
+  then release their writer before the desktop runs the first turn.
+- Desktop IPC is an internal protocol verified with ChatGPT 26.1111.21308 (state protocol 13), while retaining state protocol 11 support. Unverified protocol versions fail explicitly.
+  Temporary conversations have no persisted record for the desktop to resume and continue using the data service's in-memory sessions.
 - The bridge has zero dependencies (Node built-in modules only); the WebSocket-over-Unix-socket client is hand-written.
 
 ## Installation
 
 Prerequisites:
 
-- macOS with the **Codex desktop app** installed and signed in (the bridge attaches to the daemon it already runs).
+- macOS with the **ChatGPT desktop app** installed and signed in, Codex available, and an existing conversation data service.
 - Node.js: `node` from `PATH` is preferred; otherwise the runtime bundled with Codex is used, or point
   `CODEX_REMOTE_NODE=/path/to/node` at one. **Zero dependencies, no `npm install`.**
 
@@ -134,19 +139,39 @@ What you can do:
 
 - **Session list** in the sidebar: name, preview, running state (running / waiting for approval), relative time;
   the current session is highlighted.
-- **Session view**: your messages and agent replies (Markdown) stay in the main conversation. Commentary, reasoning,
-  commands, tool calls, and file changes are grouped into a collapsed **Execution history** summary. While running,
-  the summary shows the latest progress and current activity; when finished it shows execution / file / tool counts
-  and any failed steps. Expand it to inspect commands, exit codes, output, reasoning, diffs, and plans. Details are
-  rendered on demand, and expanded sections stay open during live updates. Older providers without a message `phase`
-  still keep their final reply visible; user steering and partial answers keep their original order.
+- **Session view**: your messages, agent replies, progress updates, reasoning text, and plans stay visible in the
+  main conversation, in their original order. Consecutive commands, tool calls, and file changes are grouped into
+  a collapsed **Execution history** summary showing the current activity, execution / file / tool counts, and
+  any failed steps. Running tools also stay collapsed until you expand them to inspect commands, exit codes,
+  output, and diffs. Details are rendered on demand, and expanded sections stay open during live updates.
+  All agent text stays visible even when an older provider omits the message `phase`.
+- **Drag images into the web client**: open a chat and drop one or more image files anywhere on the page.
+  The composer shows a drop hint, then attachment previews with removal buttons. A message accepts up to six
+  images across consecutive drops and file-picker selections. Switching chats cancels images still being read.
 - **Per-session model switching**: the model button above the composer opens a model and reasoning-effort picker.
   Choices come from the connected Codex daemon's `model/list` catalog. The bridge validates supported efforts and
   saves each session's choice in `~/.codex-remote/models.json`; refreshes and other browsers on the same bridge keep it.
-  It applies to the next new turn, including the `codex queue` fallback when the desktop owns the session. Steering
-  keeps the active turn's model. **Follow desktop** removes the bridge's override, and the panel separately shows the
+  It applies to the next turn started by the bridge. Queued input uses the desktop session's existing settings;
+  the saved selection is kept for the next bridge-started turn. Steering keeps the active turn's model.
+  **Follow desktop** removes the bridge's override, and the panel separately shows the
   model currently in effect. New chats can pick a model before creation; ephemeral chat choices stay in memory.
   The catalog describes selectable models; the provider still determines inference access when a turn runs.
+- **Working projects**: the sidebar's **Working now** section shows project names, active chat counts, and pending
+  approvals. Click a project to open one of its working chats. Started, completed, and interrupted turns update the
+  section automatically. Collapsed project groups keep an active count. Project groups and working-project
+  shortcuts retain the project catalog's order as chats update; both sidebar lists preserve their scroll position.
+  Chats match an explicit project ID or the most specific project root; unregistered workspaces use their folder name.
+  Older active chats are added from list pagination so the overview is not limited to the latest 40 chats.
+- **Codex and CC Switch usage overview**: tap the gauge in the browser title bar to see every Usage limit window
+  returned by Codex (used / remaining percentage, reset time, plan, and any available reset credits). The bridge reads
+  the official app-server `account/rateLimits/read` method, refreshes after `account/rateLimits/updated`, and otherwise
+  keeps a 30-second cache; the open panel refreshes every 30 seconds. The same panel shows **CC Switch · Today**:
+  real tokens, request count, recorded estimated
+  cost, and an app breakdown. This is calculated read-only from `~/.cc-switch/cc-switch.db` with the system `sqlite3`,
+  using CC Switch's current fresh-input normalization and session/proxy deduplication rules. The native macOS dashboard
+  has compact cards for both summaries. Only aggregate figures cross the authenticated bridge: API keys, provider or
+  account details, database paths, and request/response bodies are never returned. An older Codex app-server, a missing
+  CC Switch database, or a missing `sqlite3` simply produces an unavailable state instead of breaking the page.
 - Keep going with the composer at the bottom; press **Interrupt** while a turn is running.
 - **Unread dot**: when a session finishes a turn while you are not looking at it (or the page is in the background),
   a small blue dot appears in front of its name in the list; opening that session clears it. The state lives in the
@@ -155,23 +180,24 @@ What you can do:
   running turn you see `● Running 1:23` (pulsing dot + ticking clock). The baseline is the server's `turn.startedAt`
   (falling back to the moment the bridge first saw the turn start); formats are `0:12` / `1:23` / `1:02:03`.
   It ticks once a second, updates only that text node, and stops while the page is in the background.
-- **Take over a turn running on the desktop**: while a desktop-owned turn is running, a **Take over** button appears
-  next to the timer. It joins the same thread — no need to close the desktop session or move focus — and Interrupt /
-  Steer then act on that running turn. The phone re-reads the latest turn every 2 seconds so new output and tool calls
-  show up; once the turn is done, the bridge hands the writer lock back to the desktop instead of holding it.
+- **Connect to a desktop turn**: desktop IPC supplies the conversation's state and approval requests.
+  Interrupt and Steer run in the owning ChatGPT window; the bridge does not take over the turn in an independent backend.
+  The phone still re-reads the latest turn every 2 seconds for output and tool updates.
 - **Sending during a running turn attaches the message instead of interrupting** (matches the desktop app): pressing
   Send while a turn is running does not interrupt it — the message floats above the composer (`Pending` + text +
   `Steer` / `✕`) and is sent as a new turn when the current one finishes. Switching sessions, or even closing and
   reopening the page (the pending list is kept in `localStorage`), keeps it waiting. To inject it into the running turn
-  immediately, press **Steer** on that row — this uses the daemon's native `turn/steer` and does not start a new turn.
+  immediately, press **Steer** on that row — ChatGPT handles it in the current turn.
   Attaching and steering **show no floating toasts** (the row above the composer, and the message inserted back into the
-  conversation, are the acknowledgement); only when the daemon really queues a run (`codex queue`) does the message get
-  a line underneath: "Queued · runs when the desktop turn finishes". There are only ever two buttons next to the
+  conversation, are the acknowledgement); only when the daemon really queues input does the message get
+  a line underneath: "Queued · waiting for the desktop to receive it". There are only ever two buttons next to the
   composer: Send, and Interrupt while running. The daemon does not always emit `turn/completed` for an interrupted
   turn, so the bridge and the page reconcile against the server's turn state on every read — a phantom "running"
   state cannot block pending messages.
-- **Automatic queueing when the desktop owns the session**: if a message arrives while the desktop is using that
-  session (`already has an active writer`), the bridge falls back to `codex queue` and runs it once the current turn ends.
+- **Delivering to desktop conversations**: messages and images use the owning window's follower API. Explicit model
+  and permission settings are confirmed by ChatGPT before a new turn starts; steering keeps the current turn's settings.
+  An unconfirmed response asks you to refresh before retrying and is never submitted through a second path.
+  Unsupported data-queue methods report an update requirement without executing a command-line tool.
 - **Approval cards**: when Codex asks to run a command or edit files, the phone shows Allow / Allow for this session /
   Deny / Deny and interrupt.
 - **New chat / rename / pin**: ＋ in the title bar creates a chat (default location `~/Documents/Codex/chat`; new chats are
@@ -204,7 +230,7 @@ What you can do:
     (`thread/turns/list` does not support them either), so the bridge caches their events in order (up to 4000) and
     replays them when the page reopens — a refresh still shows the whole conversation, including your own messages
     (the daemon's `turn/completed` only carries a summary, so the replay trusts `item/*` events).
-  - Ephemeral sessions cannot be queued (no rollout for `codex queue` to use); sending while one is running tells you
+  - Ephemeral sessions cannot use the persistent input queue; sending while one is running tells you
     to wait.
 - **Per-session permission profile**: the small dot at the top left of the composer opens four choices; you can also
   pick one when creating a chat. The profile follows the session (stored in `~/.codex-remote/permissions.json` on the
@@ -214,14 +240,15 @@ What you can do:
   | Profile | Meaning | Codex equivalent |
   | --- | --- | --- |
   | Follow desktop | Sends no override; uses whatever the session is set to on the desktop | default |
-  | Decide for itself | Runs freely inside the workspace, asks with a card when crossing the boundary / needing network | `-s workspace-write` + `on-request` |
-  | Decide for me | Out-of-bounds requests go to Codex's review sub-agent, no interruption | `--approve-for-me` |
-  | Full access | No prompts, no sandbox, every command runs | `--dangerously-bypass-approvals-and-sandbox` |
+  | Decide for itself | Runs freely inside the workspace, asks with a card when crossing the boundary / needing network | `workspaceWrite` + `on-request` |
+  | Decide for me | Out-of-bounds requests go to Codex's review sub-agent, no interruption | `approvalsReviewer: auto_review` |
+  | Full access | No prompts, no sandbox, every command runs | `dangerFullAccess` + `never` |
 
-  It applies to the next message: when sending, the bridge passes the profile on both `thread/resume` and
-  `turn/start`; if the session is owned by the desktop and can only be queued, it is translated into `codex queue`
-  arguments. The top right of the panel shows the setting **actually in effect on the computer** (from the daemon's
-  `thread/settings/updated`); `—` right after a change, before sending anything, is normal.
+  It applies to the next turn: persistent conversations first confirm their model and permission settings in ChatGPT,
+  then start in the owning desktop window. Steering keeps the active turn's settings.
+  Temporary conversations apply the profile through the data service's `turn/start` API.
+  The top right of the panel shows the setting **actually in effect on the computer** from the desktop subscription
+  or the data service; `—` right after a change, before sending anything, is normal.
 - **Light / dark theme**: follows the phone's system by default; the `🌓` button at the top of the sidebar cycles
   `Follow system → ☀️ Light → 🌙 Dark`, stored in `localStorage` under `codex.theme`. (It lives in the sidebar because
   the title bar is reserved for the session title and status.) Both palettes are in `public/style.css`
@@ -306,8 +333,8 @@ Logs: `~/.codex-remote/bridge.log`
 
 ## Requirements
 
-- The desktop app (or `codex app-server daemon start`) is running and the control socket exists.
-  `bin/codex-remote` tries `codex app-server daemon start` on startup.
+- ChatGPT is open, and both its desktop IPC and the configured app-server data socket are reachable.
+  The bridge restores the default local data service when needed and waits for it before loading history, projects, or the model catalog. An explicit `--socket` connects to the operator's existing data service.
 - Node.js: `node` from `PATH` first, otherwise the runtime bundled with Codex.
   You can also set `CODEX_REMOTE_NODE=/path/to/node`.
 
@@ -318,6 +345,7 @@ Logs: `~/.codex-remote/bridge.log`
 | `--port` | `8787` | Port to listen on |
 | `--host` | `0.0.0.0` | Bind address; use `127.0.0.1` for local-only |
 | `--socket` | `~/.codex/app-server-control/app-server-control.sock` | app-server control socket |
+| `--no-auto-start-daemon` | off | Disable recovery of the default shared data service |
 | `--token-file` | `~/.codex-remote/token` | Token file; delete it to regenerate |
 | `--name` | hostname | Name shown in the page/tab, to tell computers apart |
 | `--name-file` | `~/.codex-remote/name` | Persisted name; `CODEX_REMOTE_NAME` also works |
@@ -336,11 +364,12 @@ Logs: `~/.codex-remote/bridge.log`
 
 | Symptom | Cause / fix |
 | --- | --- |
-| The page says "disconnected" | The daemon is not running: `codex app-server daemon start` |
+| The page says "disconnected" | Open ChatGPT; the default data service is restored automatically. For an explicit `--socket`, check that custom service. `CODEX_REMOTE_CODEX` can select the Codex executable used for recovery. |
+| ChatGPT is unavailable or its protocol is incompatible | Open Codex in the desktop app; an app update may require an updated desktop IPC adapter |
 | The phone cannot connect | Different subnet, macOS firewall, or `--host` set to `127.0.0.1` |
 | 401 unauthorized | Reopen the full address that includes `?token=` |
 | Rotate the token | Delete `~/.codex-remote/token` and restart the service |
-| Sending says "queued" | Normal: the session is running on the computer; the message runs afterwards |
+| Sending says "queued" | The desktop still owns session delivery; the message is waiting for it to receive the input |
 | A message lands below the answer / the answer appears above the message | The bridge used to append the echo of a message the daemon had not recorded yet to the end of the stream, so it looked like the answer came first. Echoes are now inserted back into their own turn: when you steer into a running turn (the daemon only records it on the next model turn, measured at tens of seconds), the message stays where you sent it and later output follows below. |
 | Tapping a link in a reply does nothing | The page handles link clicks itself (opens a new tab); if an embedded browser blocks new tabs too, long-press the link and copy the address into a browser |
 | "no rollout found" | The session id does not exist (usually a stale list); refresh the list |
@@ -353,7 +382,7 @@ Logs: `~/.codex-remote/bridge.log`
 - If both sides are behind hard NATs, upgrade both to Tailscale 1.86+, run `tailscale set --relay-server-port=40000` on a low-latency VPS, and grant it `tailscale.com/cap/relay` in the tailnet policy. DERP still handles negotiation, but relayed traffic prefers the Peer Relay.
 - When the phone and computer share a Wi-Fi network, always use the LAN address; even a direct Tailscale path cannot beat it.
 | Latency stays above 200ms | The phone is probably on a Tailscale relay, not the LAN: open the latency panel, check "ingress path", and use the LAN link it offers |
-| A permission profile is set on the phone but approvals still appear | The profile applies to the **next message**; if the desktop owns that session, `thread/resume` is rejected with `active writer` and the profile cannot be applied — send again after that turn ends |
+| A permission profile is set on the phone but approvals still appear | A bridge-started turn applies the selected profile. Queued input inherits the desktop session's settings; the phone keeps the selected profile for the next bridge-started turn |
 
 ## Files
 
@@ -361,7 +390,7 @@ Logs: `~/.codex-remote/bridge.log`
 bin/codex-remote            launcher script
 src/ws-unix.js              WebSocket-over-Unix-socket client (zero dependencies)
 src/appserver.js            app-server JSON-RPC 2.0 client
-src/codex-cli.js            locate the codex CLI + queue delivery (fallback when busy)
+src/desktop.js              ChatGPT desktop IPC, conversation control, state and approval subscriptions
 src/permissions.js          per-session permission profiles, persisted to disk
 src/models.js               model catalog validation, per-session choices, RPC parameters
 src/server.js               HTTP + SSE bridge, auth, approval forwarding
@@ -369,6 +398,7 @@ public/chat-view.js          conversation / execution grouping and activity summ
 public/                     phone UI
 launchd/                    background service template
 scripts/probe.js            connectivity probe, lists sessions directly
+scripts/probe-desktop.js    read-only desktop IPC, ownership, and approval-subscription probe
 scripts/install-launchd.sh  install the background service
 ```
 

@@ -10,48 +10,18 @@
     'collabToolCall', 'webSearch', 'imageView', 'imageGeneration', 'functionCallOutput',
   ]);
 
-  function isAnswer(item) {
-    return item.type === 'agentMessage' && (
-      item.phase === 'final_answer' || item.phase === 'partial_answer' ||
-      (Array.isArray(item.questions) && item.questions.length > 0)
-    );
-  }
-
-  /* Older providers omit phase. Keep their last reply visible, while putting
-     messages followed by more tool work into the execution history. */
-  function legacyAnswers(items) {
-    const answers = new Set();
-    let start = 0;
-    function finish(end) {
-      let candidate = -1;
-      let explicit = -1;
-      for (let index = start; index < end; index += 1) {
-        const item = items[index];
-        if (isAnswer(item)) explicit = index;
-        if (item.type === 'agentMessage' && !item.phase) candidate = index;
-      }
-      if (candidate > explicit && !items.slice(candidate + 1, end).some((item) => TOOL_TYPES.has(item.type))) {
-        answers.add(candidate);
-      }
-    }
-    for (let index = 0; index <= items.length; index += 1) {
-      if (index === items.length || items[index].type === 'userMessage' || items[index].type === 'localEcho') {
-        finish(index);
-        start = index + 1;
-      }
-    }
-    return answers;
-  }
+  const MESSAGE_TYPES = new Set([
+    'userMessage', 'localEcho', 'agentMessage', 'reasoning', 'plan', 'exitedReviewMode',
+  ]);
 
   function groupTurnItems(value) {
     const items = (Array.isArray(value) ? value : []).filter((item) => item && typeof item === 'object');
-    const legacy = legacyAnswers(items);
     const groups = [];
     for (let index = 0; index < items.length; index += 1) {
       const item = items[index];
-      const visible = item.type === 'userMessage' || item.type === 'localEcho' || item.type === 'plan' ||
-        item.type === 'exitedReviewMode' || isAnswer(item) || legacy.has(index);
-      if (visible) {
+      /* Keep every text message in chronological order. Only consecutive
+         tool and terminal records belong in the folded execution history. */
+      if (MESSAGE_TYPES.has(item.type)) {
         groups.push({ type: 'message', item });
         continue;
       }
@@ -78,7 +48,6 @@
     }
     if (item.type === 'fileChange') return '正在修改文件';
     if (item.type === 'webSearch') return '正在搜索网页';
-    if (item.type === 'reasoning') return '正在思考';
     if (item.type === 'mcpToolCall' || item.type === 'dynamicToolCall' || item.type === 'collabToolCall') return '正在调用工具';
     return '正在处理';
   }
@@ -89,7 +58,6 @@
     let tools = 0;
     let failures = 0;
     const files = new Set();
-    let commentary = '';
     let current = null;
     for (const item of items) {
       if (item.type === 'commandExecution') commands += 1;
@@ -97,8 +65,7 @@
         for (const change of item.changes || []) if (change && change.path) files.add(change.path);
       } else if (TOOL_TYPES.has(item.type)) tools += 1;
       if (failedItem(item)) failures += 1;
-      if (item.type === 'agentMessage' && item.text) commentary = String(item.text).replace(/\s+/g, ' ').trim();
-      if (item.status === 'inProgress' || item.type === 'reasoning') current = item;
+      if (item.status === 'inProgress') current = item;
     }
     const counts = [];
     if (commands) counts.push(commands + ' 次执行');
@@ -109,8 +76,7 @@
     const failed = failures > 0 || (options && options.status === 'failed');
     return {
       label: running ? activeLabel(current) : interrupted ? '已中断 · 执行过程' : '执行过程',
-      counts: counts.join(' · ') || '思考与进度',
-      preview: running ? commentary.slice(0, 120) : '',
+      counts: counts.join(' · ') || '其他活动',
       icon: running ? '◐' : failed ? '!' : interrupted ? '○' : '✓',
       failed,
       running,

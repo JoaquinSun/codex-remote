@@ -75,6 +75,37 @@ test('bridge metadata exposes the listener separately from the machine hostname'
   assert.equal((await api(bridge, '/api/meta')).body.listenHost, '0.0.0.0');
 });
 
+test('usage endpoint returns the sanitized bridge snapshot without requiring a thread', async (t) => {
+  const { bridge } = harness(t);
+  let forced = false;
+  bridge._readUsageSnapshot = async (refresh) => {
+    forced = refresh;
+    return {
+      fetchedAt: 1_800_000_000_000,
+      codex: {
+        available: true,
+        limits: [{
+          limitId: 'codex',
+          primary: { usedPercent: 20, windowDurationMins: 300, resetsAt: 1_800_000_000 },
+          secondary: null,
+        }],
+        resetCredits: null,
+      },
+      ccSwitch: {
+        available: true,
+        period: 'today',
+        summary: { requests: 2, realTotalTokens: 4096, totalCostUsd: 0.12 },
+        apps: [{ appType: 'codex', requests: 2, realTotalTokens: 4096, totalCostUsd: 0.12 }],
+      },
+    };
+  };
+  const result = await api(bridge, '/api/usage?refresh=1');
+  assert.equal(result.status, 200);
+  assert.equal(forced, true);
+  assert.equal(result.body.codex.limits[0].primary.usedPercent, 20);
+  assert.equal(result.body.ccSwitch.summary.realTotalTokens, 4096);
+});
+
 test('changing a running session saves a next-turn choice without resuming or interrupting', async (t) => {
   const { bridge } = harness(t);
   bridge.activeTurns.set('chat', 'desktop-turn');
@@ -132,24 +163,28 @@ test('steering never applies pending model changes to the active turn', async (t
   const result = await bridge._deliverMessage('chat', 'Adjust this work', [], { steer: true });
   assert.equal(result.mode, 'steered');
   assert.deepEqual(bridge.calls, [{ method: 'turn/steer', params: {
-    threadId: 'chat', expectedTurnId: 'running-turn', input: [{ type: 'text', text: 'Adjust this work' }],
+    threadId: 'chat', expectedTurnId: 'running-turn', input: [{ type: 'text', text: 'Adjust this work', text_elements: [] }],
   } }]);
 });
 
-test('busy desktop fallback passes the selected model to the CLI queue', async (t) => {
-  const { bridge, directory } = harness(t);
-  const captured = path.join(directory, 'queue-args.json');
-  bridge.codexBinary = path.join(directory, 'fake-codex');
-  fs.writeFileSync(bridge.codexBinary, '#!' + process.execPath + '\n' +
-    'require("node:fs").writeFileSync(' + JSON.stringify(captured) + ', JSON.stringify(process.argv.slice(2)));\n' +
-    'process.stdout.write("Queued message 00000000-0000-0000-0000-000000000000");\n', { mode: 0o700 });
+test('native queued input inherits session settings while pending choices remain saved', async (t) => {
+  const { bridge } = harness(t);
   bridge.models.chat = { model: 'example-deep', reasoningEffort: 'high' };
-  bridge.connection.request = async () => { throw new Error('already has an active writer'); };
+  bridge.permissions.chat = 'ask';
+  bridge.connection.request = async (method, params) => {
+    bridge.calls.push({ method, params });
+    if (method === 'thread/queue/add') {
+      return { queuedSubmission: { id: 'queue-1' } };
+    }
+    throw new Error('already has an active writer');
+  };
   const result = await bridge._deliverMessage('chat', 'Do work later', [], {});
   assert.equal(result.mode, 'queued');
-  const args = JSON.parse(fs.readFileSync(captured, 'utf8'));
-  assert.equal(args[args.indexOf('--model') + 1], 'example-deep');
-  assert.equal(args[args.indexOf('--config') + 1], 'model_reasoning_effort="high"');
+  const queued = bridge.calls.find(call => call.method === 'thread/queue/add').params;
+  assert.deepEqual(queued.input, [{ type: 'text', text: 'Do work later', text_elements: [] }]);
+  assert.equal(queued.model, undefined);
+  assert.equal(queued.approvalPolicy, undefined);
+  assert.equal(bridge.models.chat.model, 'example-deep');
 });
 
 test('ephemeral model settings stay in memory and skip resume on delivery', async (t) => {

@@ -68,6 +68,44 @@ final class AppModel: ObservableObject {
         let serverMs: Double?
     }
 
+    private struct BridgeUsage: Decodable {
+        struct CodexUsage: Decodable {
+            struct Limit: Decodable {
+                struct Window: Decodable {
+                    let usedPercent: Double?
+                    let windowDurationMins: Double?
+                    let resetsAt: Double?
+                }
+
+                let limitId: String?
+                let limitName: String?
+                let planType: String?
+                let primary: Window?
+                let secondary: Window?
+            }
+
+            let available: Bool?
+            let reason: String?
+            let limits: [Limit]?
+        }
+
+        struct CCSwitchUsage: Decodable {
+            struct Summary: Decodable {
+                let requests: Double?
+                let realTotalTokens: Double?
+                let totalCostUsd: Double?
+            }
+
+            let available: Bool?
+            let reason: String?
+            let summary: Summary?
+        }
+
+        let fetchedAt: Double?
+        let codex: CodexUsage?
+        let ccSwitch: CCSwitchUsage?
+    }
+
     private enum ProbeResult {
         case live(BridgeMeta, BridgePing?)
         case unauthorized
@@ -97,6 +135,13 @@ final class AppModel: ObservableObject {
     @Published private(set) var loginItemError: String?
     @Published private(set) var activePort = 8787
     @Published private(set) var activeLAN = true
+    @Published private(set) var codexLimitText = "—"
+    @Published private(set) var codexLimitDetail = "等待服务器"
+    @Published private(set) var codexLimitAvailable = false
+    @Published private(set) var codexLimitUsedPercent: Double?
+    @Published private(set) var ccSwitchUsageText = "—"
+    @Published private(set) var ccSwitchUsageDetail = "今日用量"
+    @Published private(set) var ccSwitchUsageAvailable = false
     @Published var revealToken = false
     @Published var settingsExpanded = false
 
@@ -171,6 +216,7 @@ final class AppModel: ObservableObject {
     private var startTask: Task<Void, Never>?
     private var probeMisses = 0
     private var activityToken: NSObjectProtocol?
+    private var usageFetchedAt: Date?
 
     private enum Keys {
         static let port = "CodexRemote.port"
@@ -288,6 +334,93 @@ final class AppModel: ObservableObject {
     }
 
     var clientCountText: String { "\(clientCount)" }
+
+    private func compactUsageNumber(_ value: Double) -> String {
+        let amount = max(value, 0)
+        if amount >= 100_000_000 {
+            return String(format: amount >= 1_000_000_000 ? "%.0f 亿" : "%.1f 亿", amount / 100_000_000)
+        }
+        if amount >= 10_000 {
+            return String(format: amount >= 1_000_000 ? "%.0f 万" : "%.1f 万", amount / 10_000)
+        }
+        return NumberFormatter.localizedString(from: NSNumber(value: amount.rounded()), number: .decimal)
+    }
+
+    private func usagePercentText(_ value: Double) -> String {
+        let amount = max(value, 0)
+        if abs(amount.rounded() - amount) < 0.05 { return "\(Int(amount.rounded()))%" }
+        return String(format: "%.1f%%", amount)
+    }
+
+    private func usageWindowLabel(_ minutes: Double?) -> String {
+        guard let minutes, minutes > 0 else { return "额度窗口" }
+        let rounded = Int(minutes.rounded())
+        if rounded % 1_440 == 0 { return "\(rounded / 1_440) 天" }
+        if rounded % 60 == 0 { return "\(rounded / 60) 小时" }
+        return "\(rounded) 分钟"
+    }
+
+    private func usageCostText(_ value: Double) -> String {
+        if value <= 0 { return "$0" }
+        if value < 0.01 { return "<$0.01" }
+        if value < 100 { return String(format: "$%.2f", value) }
+        return String(format: "$%.0f", value)
+    }
+
+    private func applyUsage(_ usage: BridgeUsage) {
+        if usage.codex?.available == true,
+           let limits = usage.codex?.limits, !limits.isEmpty {
+            let preferred = limits.first(where: { $0.limitId == "codex" }) ?? limits[0]
+            let windows = [preferred.primary, preferred.secondary].compactMap { $0 }
+            if windows.isEmpty {
+                codexLimitText = "—"
+                codexLimitDetail = "没有可显示的额度窗口"
+                codexLimitAvailable = false
+                codexLimitUsedPercent = nil
+            } else {
+                codexLimitText = windows.prefix(2)
+                    .map { usagePercentText($0.usedPercent ?? 0) }
+                    .joined(separator: " · ")
+                var detailParts = windows.prefix(2).map { usageWindowLabel($0.windowDurationMins) }
+                if let plan = preferred.planType, !plan.isEmpty {
+                    detailParts.append(plan.capitalized)
+                }
+                codexLimitDetail = detailParts.joined(separator: " / ")
+                codexLimitAvailable = true
+                codexLimitUsedPercent = windows.compactMap(\.usedPercent).max()
+            }
+        } else {
+            codexLimitText = "—"
+            codexLimitAvailable = false
+            codexLimitUsedPercent = nil
+            switch usage.codex?.reason {
+            case "disconnected": codexLimitDetail = "Codex 未连接"
+            case "unsupported": codexLimitDetail = "当前 Codex 版本不支持"
+            case "notAvailable": codexLimitDetail = "当前登录方式未返回额度"
+            default: codexLimitDetail = "额度暂不可用"
+            }
+        }
+
+        if usage.ccSwitch?.available == true, let summary = usage.ccSwitch?.summary {
+            ccSwitchUsageText = compactUsageNumber(summary.realTotalTokens ?? 0) + " Token"
+            let requests = Int(max(summary.requests ?? 0, 0).rounded())
+            ccSwitchUsageDetail = "今日 · \(requests) 次 · \(usageCostText(summary.totalCostUsd ?? 0))"
+            ccSwitchUsageAvailable = true
+        } else {
+            ccSwitchUsageText = "—"
+            ccSwitchUsageAvailable = false
+            switch usage.ccSwitch?.reason {
+            case "notInstalled": ccSwitchUsageDetail = "未检测到 CC Switch"
+            case "sqliteUnavailable": ccSwitchUsageDetail = "系统 sqlite3 不可用"
+            default: ccSwitchUsageDetail = "今日用量暂不可用"
+            }
+        }
+        if let fetchedAt = usage.fetchedAt {
+            usageFetchedAt = Date(timeIntervalSince1970: fetchedAt / 1_000)
+        } else {
+            usageFetchedAt = Date()
+        }
+    }
 
     // MARK: - Lifecycle
 
@@ -514,6 +647,9 @@ final class AppModel: ObservableObject {
         refreshLogTail()
         refreshKeepAwake()
         startMonitor()
+        Task { [weak self] in
+            await self?.fetchUsage(force: true)
+        }
     }
 
     private func startMonitor() {
@@ -549,6 +685,7 @@ final class AppModel: ObservableObject {
             updateListener(from: meta)
             refreshEndpoints()
             refreshLogTail()
+            await fetchUsage()
             if lastError != nil { lastError = nil }
         case .unauthorized:
             probeMisses += 1
@@ -650,6 +787,32 @@ final class AppModel: ObservableObject {
               http.statusCode == 200
         else { return nil }
         return try? JSONDecoder().decode(BridgePing.self, from: data)
+    }
+
+    private func fetchUsage(force: Bool = false) async {
+        guard phase == .running else { return }
+        if !force, let usageFetchedAt, Date().timeIntervalSince(usageFetchedAt) < 25 { return }
+        guard var components = apiURL(path: "/api/usage").flatMap({ URLComponents(url: $0, resolvingAgainstBaseURL: false) })
+        else { return }
+        if force { components.queryItems = [URLQueryItem(name: "refresh", value: "1")] }
+        guard let usageURL = components.url else { return }
+        var request = URLRequest(url: usageURL)
+        request.timeoutInterval = 7
+        request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        if let token = readToken() {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        guard let (data, response) = try? await session.data(for: request),
+              phase == .running,
+              let http = response as? HTTPURLResponse,
+              http.statusCode == 200,
+              let usage = try? JSONDecoder().decode(BridgeUsage.self, from: data)
+        else { return }
+        applyUsage(usage)
+    }
+
+    func refreshUsageNow() async {
+        await fetchUsage(force: true)
     }
 
     private func apiURL(path: String) -> URL? {
@@ -900,13 +1063,21 @@ final class AppModel: ObservableObject {
         phase = .running
         detail = "服务器正在运行"
         ownsServer = true
-        bridgeVersion = "1.10.1"
+        bridgeVersion = "1.11.0"
         bridgeName = "Demo Mac"
         hostName = "demo-mac.local"
         daemonConnected = true
         daemonLatency = 12
         serverLatency = 1.4
         clientCount = 2
+        codexLimitText = "24% · 11%"
+        codexLimitDetail = "5 小时 / 7 天 / Pro"
+        codexLimitAvailable = true
+        codexLimitUsedPercent = 24
+        ccSwitchUsageText = "2522 万 Token"
+        ccSwitchUsageDetail = "今日 · 204 次 · $9.90"
+        ccSwitchUsageAvailable = true
+        usageFetchedAt = Date()
         startedAt = Date().addingTimeInterval(-(2 * 3600 + 18 * 60))
         uptime = 2 * 3600 + 18 * 60
         activePort = 8787
@@ -920,7 +1091,7 @@ final class AppModel: ObservableObject {
           listening         : http://0.0.0.0:8787
           token file        : ~/.codex-remote/token
 
-        14:32:07 app-server connected (v1.10.1)
+        14:32:07 app-server connected (v1.11.0)
         14:32:07 thread/list 40 sessions
         14:33:21 SSE client connected
         14:34:02 turn/started 01J9Z3K2
@@ -945,6 +1116,16 @@ final class AppModel: ObservableObject {
     private func setPhase(_ phase: Phase, _ detail: String) {
         self.phase = phase
         self.detail = detail
+        if phase != .running {
+            usageFetchedAt = nil
+            codexLimitText = "—"
+            codexLimitDetail = "等待服务器"
+            codexLimitAvailable = false
+            codexLimitUsedPercent = nil
+            ccSwitchUsageText = "—"
+            ccSwitchUsageDetail = "等待服务器"
+            ccSwitchUsageAvailable = false
+        }
     }
 
     func dismissError() {

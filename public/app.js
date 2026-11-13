@@ -16,6 +16,8 @@ const state = {
   turns: [],
   pendingApprovals: new Map(),
   activeTurns: {},
+  threadStatusRevision: 0,
+  threadStatusUpdates: new Map(),
   /* 桥接是否已经加入这个会话（能直接 steer/interrupt 桌面端正在跑的那一轮） */
   attached: {},
   liveTimer: null,
@@ -45,6 +47,10 @@ const state = {
   pinnedToBottom: true,
   renderScheduled: false,
   latency: null,
+  usage: null,
+  usageLoading: false,
+  usageLoadedAt: 0,
+  usageError: '',
   permissionProfiles: [],
   threadModes: {},
   permission: null,
@@ -91,6 +97,14 @@ const dom = {
   latencyAt: document.getElementById('latency-at'),
   latencyVersion: document.getElementById('latency-version'),
   latencyHint: document.getElementById('latency-hint'),
+  usageButton: document.getElementById('usage-button'),
+  usagePanel: document.getElementById('usage-panel'),
+  usageRefresh: document.getElementById('usage-refresh'),
+  usageChecked: document.getElementById('usage-checked'),
+  usagePlan: document.getElementById('usage-plan'),
+  usageCodexBody: document.getElementById('usage-codex-body'),
+  usageCCBody: document.getElementById('usage-cc-body'),
+  usageError: document.getElementById('usage-error'),
   newChatButton: document.getElementById('new-chat-button'),
   newChatModal: document.getElementById('new-chat-modal'),
   newChatName: document.getElementById('new-chat-name'),
@@ -116,6 +130,10 @@ const dom = {
   jumpBottom: document.getElementById('jump-bottom'),
   sidebarNewEphemeral: document.getElementById('sidebar-new-ephemeral'),
   projectAdd: document.getElementById('project-add'),
+  workingProjects: document.getElementById('working-projects'),
+  workingProjectsList: document.getElementById('working-projects-list'),
+  workingProjectsCount: document.getElementById('working-projects-count'),
+  workingProjectsEmpty: document.getElementById('working-projects-empty'),
   newProjectModal: document.getElementById('new-project-modal'),
   newProjectName: document.getElementById('new-project-name'),
   newProjectPath: document.getElementById('new-project-path'),
@@ -147,6 +165,7 @@ const dom = {
   attachButton: document.getElementById('attach-button'),
   attachInput: document.getElementById('attach-input'),
   attachStrip: document.getElementById('attach-strip'),
+  imageDropHint: document.getElementById('image-drop-hint'),
   sendButton: document.getElementById('send-button'),
   stopButton: document.getElementById('stop-button'),
   pendingStrip: document.getElementById('pending-strip'),
@@ -667,13 +686,8 @@ function flushItemDelta(item) {
     return;
   }
   if (item.type === 'reasoning') {
-    const reasoning = reasoningText(item);
-    const summary = root.querySelector('summary');
-    if (summary) {
-      summary.textContent = '思考过程 · ' + reasoning.text.replace(/\s+/g, ' ').slice(0, 48);
-    }
     const body = root.querySelector('.reasoning-body');
-    if (body) body.textContent = reasoning.text;
+    if (body) body.innerHTML = renderMarkdown(reasoningText(item).text, currentCwd());
     return;
   }
   if (item.type === 'commandExecution') {
@@ -759,6 +773,12 @@ function applyEventLog(events) {
 function handleNotification(method, params) {
   const data = params || {};
 
+  if (method === 'account/rateLimits/updated') {
+    state.usageLoadedAt = 0;
+    if (!dom.usagePanel.hidden) loadUsage(true);
+    return;
+  }
+
   if (method === 'thread/status/changed') {
     const thread = state.threads.find((candidate) => candidate.id === data.threadId);
     if (thread && data.status) thread.status = data.status;
@@ -791,6 +811,7 @@ function handleNotification(method, params) {
     state.activeTurns[data.threadId] = data.turn.id;
     syncThreadRunningFlag(data.threadId, true);
     renderListQuiet();
+    if (!state.foldingEvents && !state.threads.some((thread) => thread.id === data.threadId)) loadThreads();
   } else if (method === 'turn/completed' && data.threadId) {
     if (!data.turn || state.activeTurns[data.threadId] === data.turn.id) {
       delete state.activeTurns[data.threadId];
@@ -889,6 +910,7 @@ function handleEvent(event) {
       (event.pendingApprovals || []).map((record) => [String(record.requestId), record])
     );
     state.activeTurns = event.activeTurns || {};
+    renderListQuiet();
     updateStatusLine();
     if (state.connected && !state.models.length) loadModels();
     renderApprovals();
@@ -939,6 +961,12 @@ function handleEvent(event) {
     return;
   }
 
+  if (event.type === 'usage-invalidated') {
+    state.usageLoadedAt = 0;
+    if (!dom.usagePanel.hidden) loadUsage(true);
+    return;
+  }
+
   if (event.type === 'notification') handleNotification(event.method, event.params);
 }
 
@@ -968,6 +996,7 @@ function updateStatusLine() {
   if (state.connected) setStatus('已连接 · ' + state.threads.length + ' 个会话', 'online');
   else if (state.connectionError) setStatus('未连接：' + state.connectionError, 'offline');
   else setStatus('实时连接中断，正在自动重连 · ' + state.threads.length + ' 个会话', 'offline');
+  renderWorkingProjects();
 }
 
 /* ---------- 连接延时 ---------- */
@@ -1235,8 +1264,219 @@ function toggleLatencyPanel(show) {
   if (!next) return;
   togglePermissionPanel(false);
   toggleModelPanel(false);
+  toggleUsagePanel(false);
   anchorLatencyPanel();
   measureLatency();
+}
+
+/* ---------- Codex quota + CC Switch daily usage ---------- */
+
+const USAGE_APP_LABELS = {
+  claude: 'Claude',
+  codex: 'Codex',
+  gemini: 'Gemini',
+  grokbuild: 'Grok Build',
+  opencode: 'OpenCode',
+  pi: 'Pi',
+  omp: 'Oh My Pi',
+  mcode: 'MiniMax Code',
+  kimi: 'Kimi Code',
+  dsh: 'DeepSeek',
+  agy: 'Antigravity',
+  copilot: 'Copilot',
+};
+
+function usageNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? Math.max(0, number) : 0;
+}
+
+function formatCompactUsage(value) {
+  const number = usageNumber(value);
+  try {
+    return new Intl.NumberFormat('zh-CN', {
+      notation: 'compact',
+      maximumFractionDigits: number < 10000 ? 0 : 1,
+    }).format(number);
+  } catch (error) {
+    if (number >= 1e9) return (number / 1e9).toFixed(1) + 'B';
+    if (number >= 1e6) return (number / 1e6).toFixed(1) + 'M';
+    if (number >= 1e3) return (number / 1e3).toFixed(1) + 'K';
+    return String(Math.round(number));
+  }
+}
+
+function formatUsageUsd(value) {
+  const number = usageNumber(value);
+  if (number === 0) return '$0';
+  if (number < 0.01) return '<$0.01';
+  if (number < 100) return '$' + number.toFixed(2);
+  return '$' + Math.round(number).toLocaleString();
+}
+
+function usagePercent(value) {
+  const number = usageNumber(value);
+  return (Math.round(number * 10) / 10).toLocaleString() + '%';
+}
+
+function usageWindowLabel(minutes) {
+  const value = usageNumber(minutes);
+  if (!value) return '额度窗口';
+  if (value % 1440 === 0) return value / 1440 + ' 天';
+  if (value % 60 === 0) return value / 60 + ' 小时';
+  return Math.round(value) + ' 分钟';
+}
+
+function usageResetLabel(seconds) {
+  const timestamp = usageNumber(seconds) * 1000;
+  if (!timestamp) return '重置时间未知';
+  if (timestamp <= Date.now()) return '等待刷新';
+  const date = new Date(timestamp);
+  const today = new Date();
+  const sameDay = date.toDateString() === today.toDateString();
+  return date.toLocaleString([], sameDay
+    ? { hour: '2-digit', minute: '2-digit' }
+    : { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }) + ' 重置';
+}
+
+function codexUsageUnavailable(reason) {
+  if (reason === 'disconnected') return 'Codex 未连接，暂时读不到账户额度。';
+  if (reason === 'unsupported') return '当前 Codex app-server 版本还不支持额度读取。';
+  if (reason === 'notAvailable') return '当前登录方式没有返回 Usage limit。';
+  return '暂时读不到 Codex Usage limit，稍后可以手动刷新。';
+}
+
+function ccSwitchUsageUnavailable(reason) {
+  if (reason === 'notInstalled') return '没有检测到 CC Switch 的本机用量数据库。';
+  if (reason === 'sqliteUnavailable') return '系统缺少 sqlite3，无法读取 CC Switch 用量。';
+  return '暂时读不到 CC Switch 用量；CC Switch 正在写数据库时可以稍后重试。';
+}
+
+function renderCodexUsage(codex) {
+  const limits = codex && Array.isArray(codex.limits) ? codex.limits : [];
+  const plans = [...new Set(limits.map((limit) => limit.planType).filter(Boolean))];
+  dom.usagePlan.textContent = plans.join(' · ');
+  if (!codex || !codex.available || limits.length === 0) {
+    dom.usageCodexBody.innerHTML =
+      '<p class="usage-empty">' + escapeHtml(codexUsageUnavailable(codex && codex.reason)) + '</p>';
+    return;
+  }
+
+  const windows = [];
+  for (const limit of limits) {
+    for (const window of [limit.primary, limit.secondary]) {
+      if (!window) continue;
+      const bucket = limit.limitName || (limits.length > 1 ? limit.limitId : '');
+      windows.push({ bucket, window });
+    }
+  }
+  const html = windows.map(({ bucket, window }) => {
+    const used = usageNumber(window.usedPercent);
+    const width = Math.min(100, used);
+    const level = used >= 90 ? ' danger' : used >= 70 ? ' warn' : '';
+    const label = [bucket, usageWindowLabel(window.windowDurationMins)].filter(Boolean).join(' · ');
+    return (
+      '<div class="usage-limit' + level + '">' +
+        '<div class="usage-limit-head"><span class="usage-limit-label">' + escapeHtml(label) +
+        '</span><span class="usage-limit-value">' + usagePercent(used) + '</span></div>' +
+        '<div class="usage-progress" role="progressbar" aria-label="' + escapeHtml(label) +
+        '" aria-valuemin="0" aria-valuemax="100" aria-valuenow="' + escapeHtml(width) + '">' +
+        '<span style="width:' + width + '%"></span></div>' +
+        '<div class="usage-limit-foot"><span>剩余 ' + usagePercent(Math.max(0, 100 - used)) +
+        '</span><span>' + escapeHtml(usageResetLabel(window.resetsAt)) + '</span></div>' +
+      '</div>'
+    );
+  }).join('');
+  const credits = Number.isFinite(codex.resetCredits) && codex.resetCredits > 0
+    ? '<div class="usage-apps"><span class="usage-app">可用额度重置 × ' +
+      Math.floor(codex.resetCredits) + '</span></div>'
+    : '';
+  dom.usageCodexBody.innerHTML = html + credits;
+}
+
+function renderCCSwitchUsage(ccSwitch) {
+  if (!ccSwitch || !ccSwitch.available) {
+    dom.usageCCBody.innerHTML =
+      '<p class="usage-empty">' + escapeHtml(ccSwitchUsageUnavailable(ccSwitch && ccSwitch.reason)) + '</p>';
+    return;
+  }
+  const summary = ccSwitch.summary || {};
+  const apps = Array.isArray(ccSwitch.apps) ? ccSwitch.apps : [];
+  const appHtml = apps.slice(0, 6).map((app) => {
+    const label = USAGE_APP_LABELS[app.appType] || app.appType || '其他';
+    return '<span class="usage-app">' + escapeHtml(label) + ' · ' +
+      escapeHtml(formatCompactUsage(app.realTotalTokens)) + '</span>';
+  }).join('');
+  dom.usageCCBody.innerHTML =
+    '<div class="usage-metrics">' +
+      '<div class="usage-metric"><span>真实 Token</span><strong>' +
+      escapeHtml(formatCompactUsage(summary.realTotalTokens)) + '</strong></div>' +
+      '<div class="usage-metric"><span>请求</span><strong>' +
+      escapeHtml(formatCompactUsage(summary.requests)) + '</strong></div>' +
+      '<div class="usage-metric"><span>估算成本</span><strong>' +
+      escapeHtml(formatUsageUsd(summary.totalCostUsd)) + '</strong></div>' +
+    '</div>' +
+    (appHtml ? '<div class="usage-apps">' + appHtml + '</div>' : '');
+}
+
+function renderUsage() {
+  const snapshot = state.usage;
+  if (!snapshot && state.usageLoading) {
+    dom.usagePlan.textContent = '';
+    dom.usageCodexBody.innerHTML = '<p class="usage-empty">正在读取 Codex 额度…</p>';
+    dom.usageCCBody.innerHTML = '<p class="usage-empty">正在读取 CC Switch 今日用量…</p>';
+  } else {
+    renderCodexUsage(snapshot && snapshot.codex);
+    renderCCSwitchUsage(snapshot && snapshot.ccSwitch);
+  }
+  const checkedAt = snapshot && Number(snapshot.fetchedAt);
+  dom.usageChecked.textContent = checkedAt
+    ? new Date(checkedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) + ' 更新'
+    : state.usageLoading ? '读取中…' : '—';
+  dom.usageRefresh.classList.toggle('loading', state.usageLoading);
+  dom.usageRefresh.disabled = state.usageLoading;
+  dom.usageError.hidden = !state.usageError;
+  dom.usageError.textContent = state.usageError;
+
+  const firstLimit = snapshot && snapshot.codex && snapshot.codex.limits && snapshot.codex.limits[0];
+  const firstWindow = firstLimit && firstLimit.primary;
+  const ccSummary = snapshot && snapshot.ccSwitch && snapshot.ccSwitch.summary;
+  dom.usageButton.title = [
+    firstWindow ? 'Codex ' + usagePercent(firstWindow.usedPercent) : 'Codex 额度',
+    ccSummary ? 'CC Switch 今日 ' + formatCompactUsage(ccSummary.realTotalTokens) + ' Token' : 'CC Switch 用量',
+  ].join(' · ');
+}
+
+async function loadUsage(force = false) {
+  if (state.usageLoading) return;
+  if (!force && state.usage && Date.now() - state.usageLoadedAt < 30000) {
+    renderUsage();
+    return;
+  }
+  state.usageLoading = true;
+  state.usageError = '';
+  renderUsage();
+  try {
+    const result = await api('/api/usage' + (force ? '?refresh=1' : ''));
+    state.usage = result;
+    state.usageLoadedAt = Date.now();
+  } catch (error) {
+    state.usageError = '用量读取失败：' + error.message;
+  } finally {
+    state.usageLoading = false;
+    renderUsage();
+  }
+}
+
+function toggleUsagePanel(show) {
+  const next = show === undefined ? dom.usagePanel.hidden : show;
+  dom.usagePanel.hidden = !next;
+  dom.usageButton.setAttribute('aria-expanded', next ? 'true' : 'false');
+  if (!next) return;
+  toggleLatencyPanel(false);
+  togglePermissionPanel(false);
+  toggleModelPanel(false);
+  loadUsage(false);
 }
 
 /* ---------- 会话权限档位 ---------- */
@@ -1371,6 +1611,7 @@ function togglePermissionPanel(show) {
   if (next) {
     toggleModelPanel(false);
     toggleLatencyPanel(false);
+    toggleUsagePanel(false);
     renderPermissionOptions();
   }
 }
@@ -1488,6 +1729,7 @@ function toggleModelPanel(show) {
   if (!next) return;
   togglePermissionPanel(false);
   toggleLatencyPanel(false);
+  toggleUsagePanel(false);
   const selection = state.modelSelection || {};
   renderModelChoices(dom.modelSelect, selection.model || '');
   renderEffortChoices(dom.modelSelect, dom.modelEffort, selection.reasoningEffort);
@@ -1569,6 +1811,7 @@ function threadStatus(threadId) {
    两边一起校准，别让任何一份旧状态单独决定界面。 */
 function syncThreadRunningFlag(threadId, running) {
   if (!threadId) return;
+  state.threadStatusUpdates.set(threadId, { revision: ++state.threadStatusRevision, running });
   const next = { type: running ? 'active' : 'idle' };
   if (state.thread && state.thread.id === threadId) {
     state.thread.status = Object.assign({}, state.thread.status, next);
@@ -1613,23 +1856,49 @@ function projectRoot(project) {
 }
 
 function projectForThread(thread) {
-  if (!thread) return null;
-  if (thread.projectId) {
-    const byId = state.projects.find((project) => project.id === thread.projectId);
-    if (byId) return byId;
+  return CodexProjectView.projectForThread(thread, state.projects);
+}
+
+function renderWorkingProjects() {
+  if (!dom.workingProjectsList) return;
+  const scrollTop = dom.workingProjectsList.scrollTop;
+  const threads = state.thread ? state.threads.concat([state.thread]) : state.threads;
+  const waitingThreadIds = [...state.pendingApprovals.values()]
+    .map((record) => record.params && record.params.threadId).filter(Boolean);
+  const groups = state.connected
+    ? CodexProjectView.workingProjects(threads, state.projects, { activeTurns: state.activeTurns, waitingThreadIds })
+    : [];
+  dom.workingProjectsCount.textContent = String(groups.length);
+  dom.workingProjectsList.replaceChildren();
+  dom.workingProjectsEmpty.hidden = groups.length > 0;
+  dom.workingProjectsEmpty.textContent = state.connected ? '暂无正在工作的项目' : '连接后显示工作项目';
+  dom.workingProjects.classList.toggle('has-work', groups.length > 0);
+  for (const group of groups) {
+    const item = document.createElement('li');
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'working-project' + (group.waitingCount ? ' waiting' : '') +
+      (group.threads.some((thread) => thread.id === state.currentThreadId) ? ' current' : '');
+    button.title = [group.name, group.root, group.threads.length + ' 个任务进行中'].filter(Boolean).join('\n');
+    button.setAttribute('aria-label', group.name + '，' + group.threads.length + ' 个任务进行中，打开工作会话');
+    button.innerHTML =
+      '<svg class="icon" aria-hidden="true"><use href="#i-folder"></use></svg>' +
+      '<span class="working-project-name">' + escapeHtml(group.name) + '</span>' +
+      '<span class="working-project-count">' + group.threads.length + ' 进行中</span>';
+    if (group.waitingCount) {
+      const waiting = document.createElement('span');
+      waiting.className = 'working-project-waiting';
+      waiting.textContent = group.waitingCount + ' 待审批';
+      button.appendChild(waiting);
+    }
+    button.addEventListener('click', () => {
+      const current = group.threads.find((thread) => thread.id === state.currentThreadId);
+      openThread((current || group.threads[0]).id);
+    });
+    item.appendChild(button);
+    dom.workingProjectsList.appendChild(item);
   }
-  const cwd = thread.cwd || '';
-  if (!cwd) return null;
-  return (
-    state.projects.find((project) =>
-      (project.roots || []).some((root) => {
-        const rootPath = root && root.path ? root.path : '';
-        if (!rootPath) return false;
-        const base = rootPath.endsWith('/') ? rootPath : rootPath + '/';
-        return cwd === rootPath || cwd.startsWith(base);
-      })
-    ) || null
-  );
+  dom.workingProjectsList.scrollTop = scrollTop;
 }
 
 function threadActivity(thread) {
@@ -1706,6 +1975,13 @@ function appendGroup(group) {
       '</span><span class="group-count">' +
       group.threads.length +
       '</span>';
+    const workingCount = group.threads.filter((thread) => threadRunning(thread.id)).length;
+    if (workingCount) {
+      const badge = document.createElement('span');
+      badge.className = 'group-working';
+      badge.textContent = workingCount + ' 进行中';
+      head.appendChild(badge);
+    }
     head.addEventListener('click', () => toggleGroup(group.key));
     /* 项目分组右上角给个 ＋：不然只能在「新建对话」里手打路径，
        打错（比如写成 ~/… 而不是绝对路径）就归不到这个项目底下了。 */
@@ -1738,6 +2014,7 @@ function appendGroup(group) {
 }
 
 function renderList() {
+  const scrollTop = dom.threadList.scrollTop;
   dom.threadList.innerHTML = '';
 
   renderCwdOptions();
@@ -1761,6 +2038,7 @@ function renderList() {
       for (const thread of hits) dom.threadList.appendChild(threadCard(thread, {}));
     }
     updateStatusLine();
+    dom.threadList.scrollTop = scrollTop;
     return;
   }
 
@@ -1787,11 +2065,7 @@ function renderList() {
   }
   const leftovers = sortThreads(rest.filter((thread) => !assigned.has(thread.id)));
 
-  /* 最近的临时对话排最前，跟着是各项目（项目内最新的那个项目靠前），
-     最后是没归到项目的会话 */
-  const groupActivity = (group) =>
-    group.threads.length ? Math.max(...group.threads.map(threadActivity)) : 0;
-  projectGroups.sort((a, b) => groupActivity(b) - groupActivity(a));
+  /* 项目沿用项目目录的固定顺序；会话更新只改变项目内的会话和状态标记。 */
   appendGroup({ key: 'ephemeral', label: '临时对话', threads: ephemeral });
   for (const group of projectGroups) appendGroup(group);
   appendGroup({
@@ -1801,6 +2075,7 @@ function renderList() {
   });
 
   updateStatusLine();
+  dom.threadList.scrollTop = scrollTop;
 }
 
 function renderCwdOptions() {
@@ -1919,9 +2194,9 @@ function renderItem(item) {
     const reasoning = reasoningText(item);
     if (!reasoning.text) return '';
     return (
-      '<details class="block reasoning" data-item-id="' + id + '">' +
-      '<summary>思考过程 · ' + escapeHtml(reasoning.text.replace(/\s+/g, ' ').slice(0, 48)) + '</summary>' +
-      '<div class="body reasoning-body">' + escapeHtml(reasoning.text) + '</div></details>'
+      '<div class="item item-agent item-reasoning" data-item-id="' + id + '">' +
+      '<div class="reasoning-label">思考过程</div>' +
+      '<div class="md reasoning-body">' + renderMarkdown(reasoning.text, currentCwd()) + '</div></div>'
     );
   }
 
@@ -1984,17 +2259,16 @@ function renderActivitySummary(group) {
     '" aria-hidden="true">' + summary.icon + '</span><span class="activity-summary-text">' +
     '<span class="activity-title">' + escapeHtml(summary.label) + '</span>' +
     '<span class="activity-counts">' + escapeHtml(summary.counts) + '</span>' +
-    (summary.preview ? '<span class="activity-preview">' + escapeHtml(summary.preview) + '</span>' : '') +
     '</span><span class="activity-chevron" aria-hidden="true">›</span>';
 }
 
 function renderActivityBody(group) {
-  return group.items.map(renderItem).join('') + (group.includePlan ? renderPlan(group.turnId) : '');
+  return group.items.map(renderItem).join('');
 }
 
-function renderActivity(turn, group, running, includePlan, openDetails) {
+function renderActivity(turn, group, running, openDetails) {
   const id = 'activity-' + turn.id + '-' + group.key;
-  const descriptor = { items: group.items, turnId: turn.id, status: turn.status, running, includePlan };
+  const descriptor = { items: group.items, status: turn.status, running };
   state.activityGroups.set(id, descriptor);
   for (const item of group.items) if (item.id) state.activityItems.set(item.id, id);
   const open = openDetails.has(id);
@@ -2233,8 +2507,8 @@ function runIndicatorMarkup(elapsedText) {
   const id = state.currentThreadId;
   const attached = Boolean(id && state.attached[id]);
   const action = attached
-    ? '<span class="turn-owned">已接管</span>'
-    : '<button type="button" class="turn-takeover" data-takeover title="加入电脑上正在运行的这一轮，手机可直接中断或引导">接管</button>';
+    ? '<span class="turn-owned">已连接桌面</span>'
+    : '<button type="button" class="turn-takeover" data-takeover title="连接 ChatGPT 中的聊天，手机可直接中断或引导">连接桌面</button>';
   return (
     '<div class="turn-running"><span class="turn-running-dot"></span>' +
     '<span>运行中</span>' +
@@ -2406,18 +2680,18 @@ function renderThread() {
     }
     const groups = CodexChatView.groupTurnItems(streamItems);
     const hasPlan = Boolean((state.planSteps.get(turn.id) || []).length);
-    let lastActivity = groups.reduce((last, group, index) => group.type === 'activity' ? index : last, -1);
-    if (hasPlan && lastActivity === -1) {
-      const firstAnswer = groups.findIndex((group) => group.type === 'message' &&
+    if (hasPlan) {
+      const lastActivity = groups.reduce((last, group, index) => group.type === 'activity' ? index : last, -1);
+      const firstText = groups.findIndex((group) => group.type === 'message' &&
         group.item.type !== 'userMessage' && group.item.type !== 'localEcho');
-      lastActivity = firstAnswer === -1 ? groups.length : firstAnswer;
-      groups.splice(lastActivity, 0, { type: 'activity', key: 'plan', items: [] });
+      const planIndex = lastActivity >= 0 ? lastActivity + 1 : firstText >= 0 ? firstText : groups.length;
+      groups.splice(planIndex, 0, { type: 'plan' });
     }
-    for (let index = 0; index < groups.length; index += 1) {
-      const group = groups[index];
+    for (const group of groups) {
       if (group.type === 'message') body.push(group.item.type === 'localEcho' ? renderEcho(group.item.echo) : renderItem(group.item));
-      else body.push(renderActivity(turn, group, turn.status === 'inProgress' && index === lastActivity,
-        hasPlan && index === lastActivity, openDetails));
+      else if (group.type === 'plan') body.push(renderPlan(turn.id));
+      else body.push(renderActivity(turn, group, turn.status === 'inProgress' &&
+        group.items.some((item) => item.status === 'inProgress'), openDetails));
     }
     const error = turn.error
       ? '<div class="item" style="color:var(--danger);font-size:13px">' +
@@ -2441,7 +2715,7 @@ function renderThread() {
 
   if (started) parts.push(runIndicatorMarkup(formatElapsed(Date.now() / 1000 - started.at)));
 
-  /* 运行中每 2 秒会重画一次：保留用户展开的思考/工具详情，别一刷新就折叠回去 */
+  /* 运行中每 2 秒会重画一次：保留用户展开的工具详情，别一刷新就折叠回去 */
   const keepScrollTop = dom.turns.scrollTop;
   dom.turns.innerHTML = parts.join('');
   for (const id of openDetails) {
@@ -2463,7 +2737,7 @@ function renderEcho(echo) {
   });
   /* 被 daemon 排队的（电脑端占着这个会话）要说明白：它会在这之后才跑，不是在等回复 */
   const tag = echo.queued
-    ? '<div class="echo-tag">排队中 · 电脑端这一轮跑完就执行</div>'
+    ? '<div class="echo-tag">排队中 · 等待桌面端接收</div>'
     : '';
   return bubble + tag;
 }
@@ -2618,8 +2892,20 @@ function mergeShelved(threads) {
 
 async function loadThreads() {
   try {
+    const revision = state.threadStatusRevision;
     const result = await api('/api/threads?limit=40');
-    state.threads = mergeShelved(result.data || []);
+    const activeIds = Object.keys(state.activeTurns);
+    const threads = await CodexProjectView.includeWorkingThreads(result, state.threads, activeIds,
+      (cursor) => api('/api/threads?limit=100&cursor=' + encodeURIComponent(cursor)));
+    /* 列表在途时可能已收到开始/结束通知，不能让旧响应把项目状态改回去。 */
+    for (const thread of threads) {
+      const update = state.threadStatusUpdates.get(thread.id);
+      if (update && update.revision > revision) {
+        thread.status = Object.assign({}, thread.status, { type: update.running ? 'active' : 'idle' });
+      }
+    }
+    const recentIds = new Set((result.data || []).map((thread) => thread.id));
+    state.threads = mergeShelved(threads.filter((thread) => recentIds.has(thread.id) || state.activeTurns[thread.id]));
     renderList();
     pruneShelved();
   } catch (error) {
@@ -3000,6 +3286,7 @@ async function openThread(threadId, options) {
   if (!silent) {
     state.threadChecking = true;
     const switching = state.currentThreadId !== threadId;
+    if (switching) resetImageDrop();
     if (switching && state.currentThreadId) saveDraft(state.currentThreadId);
     if (switching) restoreDraft(threadId);
     state.currentThreadId = threadId;
@@ -3188,22 +3475,39 @@ function downscaleDataUrl(dataUrl, maxEdge = 1600, quality = 0.85) {
   });
 }
 
-async function handleAttachFiles(files) {
-  for (const file of files) {
-    if (!file.type.startsWith('image/')) continue;
-    if (state.attachments.length >= 6) {
-      toast('最多一次 6 张图片');
-      break;
+let resetImageDrop = () => {};
+let attachmentImportQueue = Promise.resolve();
+
+function handleAttachFiles(files) {
+  const batch = Array.from(files);
+  const threadId = state.currentThreadId;
+  const attachments = state.attachments;
+  const canImport = () => state.currentThreadId === threadId && state.attachments === attachments;
+  const importFiles = async () => {
+    for (const file of batch) {
+      if (!file.type?.startsWith('image/')) continue;
+      if (!canImport()) return;
+      if (attachments.length >= 6) {
+        toast('最多一次 6 张图片');
+        break;
+      }
+      try {
+        const raw = await fileToDataUrl(file);
+        const dataUrl = await downscaleDataUrl(raw);
+        if (!canImport()) {
+          toast('输入区已更新，图片添加已取消');
+          return;
+        }
+        attachments.push({ dataUrl, name: file.name || 'image' });
+      } catch (error) {
+        toast('添加图片失败：' + error.message);
+      }
     }
-    try {
-      const raw = await fileToDataUrl(file);
-      const dataUrl = await downscaleDataUrl(raw);
-      state.attachments.push({ dataUrl, name: file.name || 'image' });
-    } catch (error) {
-      toast('添加图片失败：' + error.message);
-    }
-  }
-  renderAttachments();
+    renderAttachments();
+  };
+  const importing = attachmentImportQueue.then(importFiles);
+  attachmentImportQueue = importing.catch(() => {});
+  return importing;
 }
 
 /* 真正把一条消息发出去：上传图片 → POST → 乐观回显。运行中排队的那条跑完自动
@@ -3258,7 +3562,7 @@ async function deliverMessage(threadId, text, attachments, options) {
     }
     scheduleRender();
     /* 引导 / 排队都不再弹悬浮提示：引导过去之后这条消息本身就立刻插在那条会话里，
-       排队的情况回显下面会挂一行「排队中 · 电脑端这一轮跑完就执行」，再弹一次是噪音。 */
+       排队的情况回显下面会挂一行「排队中 · 等待桌面端接收」，再弹一次是噪音。 */
     return result || {};
   } catch (error) {
     if (echo) state.pendingEchoes = state.pendingEchoes.filter((candidate) => candidate !== echo);
@@ -3593,14 +3897,14 @@ async function takeOverThread() {
       state.activeTurns[threadId] = result.turnId;
       syncThreadRunningFlag(threadId, true);
       startLivePolling(threadId);
-      toast('已接管，可以中断，或点「引导」把消息插进这一轮');
+      toast('已连接桌面，可以中断，或点「引导」把消息插进这一轮');
     } else {
-      toast('已接管这个会话');
+      toast('已连接桌面聊天');
     }
     renderListQuiet();
     renderThread();
   } catch (error) {
-    toast('接管失败：' + error.message);
+    toast('连接桌面失败：' + error.message);
     if (button) button.disabled = false;
   }
 }
@@ -3608,9 +3912,20 @@ async function takeOverThread() {
 function refreshCurrent() {
   loadThreads();
   if (state.currentThreadId) openThread(state.currentThreadId);
+  if (!dom.usagePanel.hidden) loadUsage(true);
 }
 
 function bindEvents() {
+  resetImageDrop = CodexImageDrop.bind({
+    target: document, viewport: window,
+    canAttach: () => Boolean(state.currentThreadId && !dom.composer.hidden),
+    onFiles: handleAttachFiles,
+    onActive: (active) => {
+      dom.composer.classList.toggle('image-drag-over', active);
+      dom.imageDropHint.hidden = !active;
+    },
+    onRejected: toast,
+  });
   dom.sidebarToggle.addEventListener('click', toggleSidebar);
   dom.sidebarCollapse.addEventListener('click', () => setSidebarCollapsed(true));
   dom.sidebarClose.addEventListener('click', closeSidebar);
@@ -3839,6 +4154,15 @@ function bindEvents() {
     toggleLatencyPanel();
   });
 
+  dom.usageButton.addEventListener('click', (event) => {
+    event.stopPropagation();
+    toggleUsagePanel();
+  });
+  dom.usageRefresh.addEventListener('click', (event) => {
+    event.stopPropagation();
+    loadUsage(true);
+  });
+
   dom.permissionButton.addEventListener('click', (event) => {
     event.stopPropagation();
     togglePermissionPanel();
@@ -3859,6 +4183,7 @@ function bindEvents() {
 
   document.addEventListener('click', (event) => {
     if (!dom.latencyPanel.hidden && !dom.latencyPanel.contains(event.target)) toggleLatencyPanel(false);
+    if (!dom.usagePanel.hidden && !dom.usagePanel.contains(event.target)) toggleUsagePanel(false);
     if (!dom.permissionPanel.hidden && !dom.permissionPanel.contains(event.target)) {
       togglePermissionPanel(false);
     }
@@ -3876,6 +4201,7 @@ function bindEvents() {
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) {
     toggleLatencyPanel(false);
+    toggleUsagePanel(false);
     togglePermissionPanel(false);
     toggleModelPanel(false);
     return;
@@ -3941,6 +4267,11 @@ setInterval(() => {
   loadThreads();
 }, 10000);
 
+setInterval(() => {
+  if (document.hidden || dom.usagePanel.hidden) return;
+  loadUsage();
+}, 30000);
+
 /* 延时是「采样」不是「连续值」：间隔太长，数字看起来就是卡住的。
    面板开着的时候 2 秒一拍（盯着看是实时的），平时 5 秒一拍。 */
 function scheduleLatency() {
@@ -3991,6 +4322,7 @@ document.addEventListener('keydown', (event) => {
   }
   if (event.key !== 'Escape') return;
   closeSidebar();
+  toggleUsagePanel(false);
   togglePermissionPanel(false);
   toggleModelPanel(false);
 });

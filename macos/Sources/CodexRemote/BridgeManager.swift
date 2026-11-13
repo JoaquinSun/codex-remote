@@ -128,8 +128,6 @@ final class BridgeManager: BridgeManaging {
             nodeDirectory,
             "/opt/homebrew/bin",
             "/usr/local/bin",
-            FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex/bin").path,
-            "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin",
             "/usr/bin",
             "/bin",
             "/usr/sbin",

@@ -6,7 +6,6 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { normalizeSelection, normalizeCatalog, validateSelection, threadParams, turnParams, effectiveModel, loadModelMap, saveModelMap } = require('../src/models');
-const { buildQueueArgs } = require('../src/codex-cli');
 
 const catalog = normalizeCatalog([
   { id: 'catalog-id', model: 'example-fast', displayName: 'Fast', defaultReasoningEffort: 'low', supportedReasoningEfforts: [{ reasoningEffort: 'low' }, { reasoningEffort: 'high' }] },
@@ -34,25 +33,16 @@ test('catalog hides hidden entries, deduplicates slugs, and supports older effor
   assert.deepEqual(models[0].inputModalities, ['text', 'image']);
 });
 
-test('follow desktop omits model overrides from both RPC paths and queue arguments', () => {
+test('follow desktop omits model overrides from both RPC paths', () => {
   const selection = normalizeSelection({ model: null });
   assert.deepEqual(threadParams(selection), {});
   assert.deepEqual(turnParams(selection), {});
-  const args = buildQueueArgs({ threadId: 'chat', text: 'hello', permissionArgs: ['--approve-for-me'] });
-  assert.ok(!args.includes('--model'));
-  assert.ok(!args.includes('--config'));
-  assert.ok(args.includes('--approve-for-me'));
 });
 
-test('effort reaches the version-specific RPC and CLI fields without shell interpolation', () => {
+test('effort reaches the native thread and turn RPC fields', () => {
   const selection = { model: 'example-fast', reasoningEffort: 'high' };
   assert.deepEqual(threadParams(selection), { model: 'example-fast', config: { model_reasoning_effort: 'high' } });
   assert.deepEqual(turnParams(selection), { model: 'example-fast', effort: 'high' });
-  const text = 'literal `command` and $(command)';
-  const args = buildQueueArgs({ threadId: 'chat', text, ...selection, remote: 'unix:///tmp/example.sock' });
-  assert.equal(args[args.indexOf('--message') + 1], text);
-  assert.equal(args[args.indexOf('--model') + 1], 'example-fast');
-  assert.equal(args[args.indexOf('--config') + 1], 'model_reasoning_effort="high"');
 });
 
 test('reads effective model and effort from metadata and settings notifications', () => {

@@ -7,7 +7,7 @@ const { groupTurnItems, activitySummary } = require('../public/chat-view');
 function item(type, id, extra = {}) { return { type, id, ...extra }; }
 function messages(groups) { return groups.filter((group) => group.type === 'message').map((group) => group.item.id); }
 
-test('groups commentary, reasoning, commands, and tools between user input and the answer', () => {
+test('keeps all text visible and folds only consecutive commands and tools', () => {
   const input = [
     item('userMessage', 'user'),
     item('agentMessage', 'progress', { phase: 'commentary', text: 'Checking files' }),
@@ -17,25 +17,26 @@ test('groups commentary, reasoning, commands, and tools between user input and t
     item('agentMessage', 'answer', { phase: 'final_answer', text: 'Done' }),
   ];
   const groups = groupTurnItems(input);
-  assert.deepEqual(groups.map((group) => group.type), ['message', 'activity', 'message']);
-  assert.deepEqual(messages(groups), ['user', 'answer']);
-  assert.deepEqual(groups[1].items.map((entry) => entry.id), ['progress', 'thought', 'command', 'tool']);
+  assert.deepEqual(groups.map((group) => group.type), ['message', 'message', 'message', 'activity', 'message']);
+  assert.deepEqual(messages(groups), ['user', 'progress', 'thought', 'answer']);
+  assert.deepEqual(groups[3].items.map((entry) => entry.id), ['command', 'tool']);
   assert.equal(input.length, 6);
 });
 
-test('retains the final answer for legacy providers that omit phase', () => {
+test('retains progress text and answers for legacy providers that omit phase', () => {
   const groups = groupTurnItems([
     item('userMessage', 'user'), item('agentMessage', 'progress', { text: 'Let me check' }),
     item('commandExecution', 'command'), item('agentMessage', 'answer', { text: 'Here is the answer' }),
   ]);
-  assert.deepEqual(messages(groups), ['user', 'answer']);
-  assert.equal(groups[1].items[0].id, 'progress');
+  assert.deepEqual(messages(groups), ['user', 'progress', 'answer']);
+  assert.equal(groups[2].items[0].id, 'command');
 });
 
-test('a legacy progress message followed by tools stays in the activity group', () => {
+test('a legacy progress message stays visible when more tool work follows', () => {
   const groups = groupTurnItems([item('agentMessage', 'progress'), item('commandExecution', 'command')]);
-  assert.equal(groups.length, 1);
-  assert.equal(groups[0].type, 'activity');
+  assert.equal(groups.length, 2);
+  assert.deepEqual(messages(groups), ['progress']);
+  assert.equal(groups[1].type, 'activity');
 });
 
 test('keeps partial answers, user steering, and optimistic echoes in their original order', () => {
@@ -46,8 +47,8 @@ test('keeps partial answers, user steering, and optimistic echoes in their origi
     item('localEcho', 'echo'), item('reasoning', 'thought'),
     item('agentMessage', 'final', { phase: 'final_answer' }),
   ]);
-  assert.deepEqual(messages(groups), ['first', 'partial', 'steering', 'echo', 'final']);
-  assert.deepEqual(groups.filter((group) => group.type === 'activity').map((group) => group.items.map((entry) => entry.id)), [['command'], ['tool'], ['thought']]);
+  assert.deepEqual(messages(groups), ['first', 'partial', 'steering', 'echo', 'thought', 'final']);
+  assert.deepEqual(groups.filter((group) => group.type === 'activity').map((group) => group.items.map((entry) => entry.id)), [['command'], ['tool']]);
 });
 
 test('questions and proposed plans remain visible for the user to respond to', () => {
@@ -70,14 +71,14 @@ test('summaries count unique changed files and expose failures without printing 
   assert.ok(!JSON.stringify(summary).includes('secret-command'));
 });
 
-test('streaming summary uses the latest progress text and a human readable current action', () => {
+test('streaming tool summary names the current action without moving progress text into it', () => {
   const summary = activitySummary([
     item('agentMessage', 'first', { phase: 'commentary', text: 'First update' }),
     item('agentMessage', 'second', { phase: 'commentary', text: 'Reading\n the source' }),
     item('commandExecution', 'command', { status: 'inProgress', command: 'cat raw-file', commandActions: [{ type: 'read' }] }),
   ], { running: true });
   assert.equal(summary.label, '正在读取文件');
-  assert.equal(summary.preview, 'Reading the source');
+  assert.ok(!JSON.stringify(summary).includes('Reading'));
   assert.ok(!JSON.stringify(summary).includes('cat raw-file'));
   assert.equal(activitySummary([], { status: 'interrupted' }).label, '已中断 · 执行过程');
 });

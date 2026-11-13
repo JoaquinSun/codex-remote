@@ -6,18 +6,17 @@ const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const zlib = require('node:zlib');
-const { spawn } = require('node:child_process');
-
-const { AppServerConnection } = require('./appserver');
-const { resolveCodexBinary, isBusyThreadError, isFreshThreadError, queueMessage } = require('./codex-cli');
+const { AppServerConnection, isBusyThreadError, isThreadNotFoundError, isFreshThreadError } = require('./appserver');
+const { defaultAppServerSocket, startManagedAppServer } = require('./daemon');
+const { DesktopConnection } = require('./desktop');
 const { RolloutWatcher } = require('./rollout');
 const { tailscaleClientInfo, warmTailscaleStatus } = require('./tailscale');
+const { normalizeRateLimits, readCCSwitchUsage } = require('./usage');
 const {
   normalizeMode,
   profileList,
   threadParams: permissionThreadParams,
   turnParams: permissionTurnParams,
-  queueArgs: permissionQueueArgs,
   sandboxLabel,
   reviewerLabel,
   modeFromSettings,
@@ -45,12 +44,6 @@ const IMAGE_EXT = { 'image/png': '.png', 'image/jpeg': '.jpg', 'image/gif': '.gi
 const PUBLIC_DIR = path.join(__dirname, '..', 'public');
 const DEFAULT_PORT = 8787;
 const DEFAULT_TOKEN_FILE = path.join(os.homedir(), '.codex-remote', 'token');
-const DEFAULT_SOCKET = path.join(
-  os.homedir(),
-  '.codex',
-  'app-server-control',
-  'app-server-control.sock'
-);
 const DEFAULT_NAME_FILE = path.join(os.homedir(), '.codex-remote', 'name');
 const DEFAULT_PERMISSION_FILE = path.join(os.homedir(), '.codex-remote', 'permissions.json');
 const DEFAULT_MODEL_FILE = path.join(os.homedir(), '.codex-remote', 'models.json');
@@ -58,11 +51,14 @@ const MODEL_CATALOG_TTL_MS = 60000;
 /* turn/steer 的 expectedTurnId 对不上（这一轮刚好跑完、或者已经换轮了）时的报错都长这样；
    这些情况下引导没意义，退回正常发送即可。 */
 const STEER_MISS_PATTERN = /expectedturnid|expected turn|no active turn|not active|turn not found|already (?:finished|completed)/i;
-const BRIDGE_VERSION = '1.10.1';
+const BRIDGE_VERSION = '1.12.3';
 /* 延时探测别被 Codex 的忙闲拖住：HTTP 最多等 350ms，超了先用上一次采样；
    采样 1.5 秒内算新鲜，不必重复问 daemon。 */
 const DAEMON_PROBE_DEADLINE_MS = 350;
 const DAEMON_SAMPLE_TTL_MS = 1500;
+/* Codex quota does not need latency-style polling. Cache both quota and the
+   read-only CC Switch daily aggregate so opening the panel is instantaneous. */
+const USAGE_SNAPSHOT_TTL_MS = 30000;
 /* 临时会话的对话内容不落盘、也不支持 thread/read(includeTurns)，
    所以桥接层自己按序缓存它的事件，重开页面时前端再回放一遍。 */
 const EPHEMERAL_EVENT_LIMIT = 4000;
@@ -292,11 +288,12 @@ const CONTENT_TYPES = {
   '.webmanifest': 'application/manifest+json',
 };
 
-function parseArguments(argv) {
+function parseArguments(argv, environment = process.env) {
   const options = {
     port: DEFAULT_PORT,
     host: '0.0.0.0',
-    socketPath: DEFAULT_SOCKET,
+    socketPath: defaultAppServerSocket(environment),
+    autoStartDaemon: true,
     tokenFile: DEFAULT_TOKEN_FILE,
     name: process.env.CODEX_REMOTE_NAME || '',
     nameFile: DEFAULT_NAME_FILE,
@@ -315,7 +312,10 @@ function parseArguments(argv) {
       index += 1;
     } else if (argument === '--socket' && next) {
       options.socketPath = next;
+      options.autoStartDaemon = false;
       index += 1;
+    } else if (argument === '--no-auto-start-daemon') {
+      options.autoStartDaemon = false;
     } else if (argument === '--token-file' && next) {
       options.tokenFile = next;
       index += 1;
@@ -479,9 +479,21 @@ class Bridge {
     this.token = loadOrCreateToken(options.tokenFile);
     this.bridgeName = readBridgeName(options);
     this.startedAt = Date.now();
-    this.codexBinary = resolveCodexBinary();
-    this.remoteTarget = options.socketPath === DEFAULT_SOCKET ? null : `unix://${options.socketPath}`;
+    this.desktop = new DesktopConnection();
+    this.desktop.on('state', (threadId, state) => this._handleDesktopState(threadId, state));
+    this.desktop.on('protocolError', error => console.error(error.message));
+    this.desktop.on('ready', () => {
+      this._broadcast({ type: 'status', connected: this._isConnected(), desktopConnected: true });
+      this._connectToAppServer();
+    });
+    this.desktop.on('close', () => {
+      if (this.shuttingDown) return;
+      this._broadcast({ type: 'status', connected: false, desktopConnected: false, error: 'ChatGPT 桌面连接已断开' });
+      this._scheduleDesktopReconnect();
+    });
     this.connection = null;
+    this.appServerConnectPromise = null;
+    this.daemonRecoveryRetryAt = 0;
     this.connectionError = 'starting';
     this.notifications = null;
     this.eventClients = new Set();
@@ -492,9 +504,9 @@ class Bridge {
     this.stoppedTurns = new Set();
     this.daemonTurnIds = new Set();
     /* Threads this bridge caused the daemon to load. The daemon keeps an
-       exclusive writer lock on every loaded thread, which is what makes the
-       desktop app report "already open in another app". We hand the lock back
-       as soon as the thread goes idle. */
+       exclusive writer lock on every loaded thread. Persistent conversations
+       now run in ChatGPT; this map only tracks metadata creation and temporary
+       conversations. Release metadata ownership before opening the desktop. */
     this.loadedThreads = new Map();
     /* 手机端发起的「临时对话」：ephemeral 会话不写盘，所以它不会出现在
        thread/list 里，daemon 只把它记在当前连接的内存中。这里自己留一份
@@ -513,6 +525,8 @@ class Bridge {
     this.daemonProbe = null;
     /* 探测失败（Codex 忙/卡住）之后先别连着再问，避免探测本身把 daemon 压得更忙 */
     this.daemonProbeBackoffUntil = 0;
+    this.usageSnapshot = null;
+    this.usageSnapshotPromise = null;
     this.rollout = new RolloutWatcher();
     this.rollout.start((threadId, snapshot, previous) => this._handleRolloutState(threadId, snapshot, previous));
   }
@@ -565,6 +579,53 @@ class Bridge {
     }
   }
 
+  async _readCodexRateLimits() {
+    if (!this.connection || !this.connection.ready) {
+      return { available: false, reason: 'disconnected', limits: [], resetCredits: null };
+    }
+    try {
+      const result = await this.connection.request('account/rateLimits/read', {}, { timeoutMs: 5000 });
+      const normalized = normalizeRateLimits(result);
+      return normalized.available
+        ? normalized
+        : Object.assign(normalized, { reason: 'notAvailable' });
+    } catch (error) {
+      const message = error?.message || String(error);
+      return {
+        available: false,
+        reason: /not supported|unknown method|method not found/i.test(message)
+          ? 'unsupported'
+          : 'queryFailed',
+        limits: [],
+        resetCredits: null,
+      };
+    }
+  }
+
+  async _readUsageSnapshot(force = false) {
+    if (
+      !force &&
+      this.usageSnapshot &&
+      Date.now() - this.usageSnapshot.fetchedAt < USAGE_SNAPSHOT_TTL_MS
+    ) {
+      return this.usageSnapshot;
+    }
+    if (this.usageSnapshotPromise) return this.usageSnapshotPromise;
+
+    this.usageSnapshotPromise = Promise.all([
+      this._readCodexRateLimits(),
+      readCCSwitchUsage(),
+    ])
+      .then(([codex, ccSwitch]) => {
+        this.usageSnapshot = { fetchedAt: Date.now(), codex, ccSwitch };
+        return this.usageSnapshot;
+      })
+      .finally(() => {
+        this.usageSnapshotPromise = null;
+      });
+    return this.usageSnapshotPromise;
+  }
+
   async start() {
     const server = http.createServer((request, response) => {
       this._handleRequest(request, response).catch((error) => {
@@ -586,6 +647,7 @@ class Bridge {
 
     this.httpServer = server;
     this._connectToAppServer();
+    this.desktop.connect().catch(() => this._scheduleDesktopReconnect());
 
     this.releaseTimer = setInterval(() => {
       for (const threadId of [...this.loadedThreads.keys()]) {
@@ -594,6 +656,10 @@ class Bridge {
     }, 20000);
 
     const shutdown = () => {
+      this.shuttingDown = true;
+      clearTimeout(this.reconnectTimer);
+      clearTimeout(this.desktopReconnectTimer);
+      this.desktop.close();
       this.releaseAllThreadLocks().then(() => process.exit(0)).catch(() => process.exit(0));
     };
     process.once('SIGINT', shutdown);
@@ -601,42 +667,107 @@ class Bridge {
     return server;
   }
 
-  _connectToAppServer() {
-    const connection = new AppServerConnection(this.options.socketPath);
+  _createAppServerConnection() {
+    return new AppServerConnection(this.options.socketPath);
+  }
+
+  _startDataDaemon() {
+    return startManagedAppServer();
+  }
+
+  async _openDataConnection() {
+    const connection = this._createAppServerConnection();
     this.connection = connection;
     this.modelCatalog = null;
     this.modelCatalogPromise = null;
 
-    connection.on('notification', (message) => this._handleNotification(message));
-    connection.on('serverRequest', (message) => this._handleServerRequest(message));
+    const current = () => this.connection === connection && !this.shuttingDown;
+    connection.on('notification', (message) => { if (current()) this._handleNotification(message); });
+    connection.on('serverRequest', (message) => { if (current()) this._handleServerRequest(message); });
     connection.on('error', (error) => {
+      if (!current()) return;
       this.connectionError = error.message;
-      this._broadcast({ type: 'status', connected: this.connection.ready, error: error.message });
+      this._broadcast({ type: 'status', connected: this._isConnected(), error: error.message });
     });
     connection.on('close', () => {
+      if (!current()) return;
       this.connectionError = 'disconnected';
+      this.usageSnapshot = null;
       this._broadcast({ type: 'status', connected: false, error: 'disconnected' });
       this._scheduleReconnect();
     });
 
-    connection
-      .connect()
-      .then(() => {
-        this.connectionError = null;
-        this._broadcast({ type: 'status', connected: true, userAgent: connection.userAgent });
-      })
-      .catch((error) => {
+    await connection.connect();
+    if (!current()) {
+      connection.close();
+      return null;
+    }
+    clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+    this.connectionError = null;
+    this.daemonRecoveryRetryAt = 0;
+    this._broadcast({ type: 'status', connected: this._isConnected(), userAgent: connection.userAgent });
+    return connection;
+  }
+
+  _connectToAppServer() {
+    if (this.shuttingDown) return Promise.resolve(null);
+    if (this.connection?.ready) return Promise.resolve(this.connection);
+    if (this.appServerConnectPromise) return this.appServerConnectPromise;
+    const pending = (async () => {
+      try {
+        return await this._openDataConnection();
+      } catch (error) {
+        const canRestore = ['ENOENT', 'ECONNREFUSED'].includes(error.code) &&
+          this.options.autoStartDaemon !== false &&
+          this.options.socketPath === defaultAppServerSocket() &&
+          this.desktop?.ready && !this.shuttingDown &&
+          Date.now() >= (this.daemonRecoveryRetryAt || 0);
+        if (!canRestore) throw error;
+        this.daemonRecoveryRetryAt = Date.now() + 30000;
+        this.connectionError = '本地聊天数据服务正在启动';
+        this._broadcast({ type: 'status', connected: false, error: this.connectionError });
+        await this._startDataDaemon();
+        if (this.shuttingDown) return null;
+        return await this._openDataConnection();
+      }
+    })().catch((error) => {
+      if (!this.shuttingDown) {
         this.connectionError = error.message;
         this._broadcast({ type: 'status', connected: false, error: error.message });
         this._scheduleReconnect();
-      });
+      }
+      return null;
+    }).finally(() => {
+      if (this.appServerConnectPromise === pending) this.appServerConnectPromise = null;
+    });
+    this.appServerConnectPromise = pending;
+    return pending;
   }
 
   _scheduleReconnect() {
-    if (this.reconnectTimer) return;
+    if (this.shuttingDown || this.reconnectTimer) return;
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
       this._connectToAppServer();
+    }, 3000);
+    this.reconnectTimer.unref?.();
+  }
+
+  async _ensureDataConnection() {
+    if (!this.connection?.ready) await this._connectToAppServer();
+    return this._requireConnection();
+  }
+
+  _isConnected() {
+    return Boolean(this.connection?.ready && (!this.desktop || this.desktop.ready));
+  }
+
+  _scheduleDesktopReconnect() {
+    if (this.shuttingDown || this.desktopReconnectTimer) return;
+    this.desktopReconnectTimer = setTimeout(() => {
+      this.desktopReconnectTimer = null;
+      this.desktop.connect().catch(() => this._scheduleDesktopReconnect());
     }, 3000);
   }
 
@@ -744,6 +875,11 @@ class Bridge {
         permission: this._permissionView(params.threadId),
       });
       this._broadcast({ type: 'model', threadId: params.threadId, modelSelection: this._modelView(params.threadId) });
+    } else if (message.method === 'account/rateLimits/updated') {
+      /* The notification can be a partial single-bucket update. Invalidate the
+         complete snapshot and let clients re-read the authoritative map. */
+      this.usageSnapshot = null;
+      this._broadcast({ type: 'usage-invalidated' });
     }
 
     this._broadcast({
@@ -763,6 +899,46 @@ class Bridge {
     };
     this.pendingApprovals.set(requestId, record);
     this._broadcast({ type: 'approval', request: record });
+  }
+
+  _handleDesktopState(threadId, state) {
+    if (!state) return;
+    this._recordThreadSettings(threadId, state.latestThreadSettings || {
+      model: state.latestModel, reasoningEffort: state.latestReasoningEffort,
+    });
+    const status = state.threadRuntimeStatus;
+    if (status?.type === 'idle' || status?.type === 'notLoaded') this.activeTurns.delete(threadId);
+    if (status) this._broadcast({ type: 'notification', method: 'thread/status/changed', params: { threadId, status } });
+    this._broadcast({ type: 'model', threadId, modelSelection: this._modelView(threadId) });
+    this._broadcast({ type: 'permission', threadId, permission: this._permissionView(threadId) });
+
+    const seen = new Set();
+    for (const request of state.requests || []) {
+      if (request.id === undefined || !request.method) continue;
+      const requestId = `desktop:${threadId}:${request.id}`;
+      seen.add(requestId);
+      if (this.pendingApprovals.has(requestId)) continue;
+      const record = {
+        requestId, desktop: true, desktopRequestId: request.id, threadId,
+        method: request.method, params: { ...request.params, threadId }, receivedAt: Date.now(),
+      };
+      this.pendingApprovals.set(requestId, record);
+      this._broadcast({ type: 'approval', request: record });
+    }
+    for (const [requestId, record] of this.pendingApprovals) {
+      if (record.desktop && record.threadId === threadId && !seen.has(requestId)) {
+        this.pendingApprovals.delete(requestId);
+        this._broadcast({ type: 'approval-resolved', requestId });
+      }
+    }
+  }
+
+  _observeDesktopThread(threadId) {
+    if (!this.desktop || this.ephemeralThreads.has(threadId) || this.desktop.following.has(threadId)) return;
+    /* Observation never opens a window or takes the writer. */
+    this.desktop.findOwner(threadId).then(owner => {
+      if (owner) this.desktop.follow(threadId, owner.clientId);
+    }).catch(() => {});
   }
 
   _broadcast(event) {
@@ -838,7 +1014,7 @@ class Bridge {
     response.write(
       `data: ${JSON.stringify({
         type: 'hello',
-        connected: Boolean(this.connection && this.connection.ready),
+        connected: this._isConnected(),
         userAgent: this.connection?.userAgent ?? null,
         error: this.connectionError,
         pendingApprovals: [...this.pendingApprovals.values()],
@@ -926,10 +1102,10 @@ class Bridge {
       return false;
     }
 
-    this.loadedThreads.delete(threadId);
     try {
       await this.connection.request('thread/archive', { threadId });
       await this.connection.request('thread/unarchive', { threadId });
+      this.loadedThreads.delete(threadId);
       console.log(`released writer lock for ${threadId}`);
       return true;
     } catch (error) {
@@ -948,7 +1124,7 @@ class Bridge {
   _requireConnection() {
     if (!this.connection || !this.connection.ready) {
       const error = new Error(
-        `app-server not connected (${this.connectionError || 'unknown'}). Start it with: codex app-server daemon start`
+        `聊天数据接口未连接（${this.connectionError || 'unknown'}）。请打开 ChatGPT 并检查配置的 app-server socket。`
       );
       error.statusCode = 503;
       throw error;
@@ -979,7 +1155,7 @@ class Bridge {
   }
 
   async _listModels(refresh = false) {
-    const connection = this._requireConnection();
+    const connection = await this._ensureDataConnection();
     if (!refresh && this.modelCatalog && Date.now() - this.modelCatalog.at < MODEL_CATALOG_TTL_MS) {
       return this.modelCatalog.data;
     }
@@ -1186,7 +1362,10 @@ class Bridge {
             platform: process.platform,
             version: BRIDGE_VERSION,
             startedAt: this.startedAt,
-            connected: Boolean(this.connection && this.connection.ready),
+            connected: this._isConnected(),
+            dataConnected: Boolean(this.connection?.ready),
+            desktopConnected: Boolean(this.desktop?.ready),
+            executionBackend: 'chatgpt-desktop',
           });
           return;
         }
@@ -1211,11 +1390,20 @@ class Bridge {
 
       if (segments[1] === 'status' && segments.length === 2) {
         sendJson(response, 200, {
-          connected: Boolean(this.connection && this.connection.ready),
+          connected: this._isConnected(),
+          dataConnected: Boolean(this.connection?.ready),
           userAgent: this.connection?.userAgent ?? null,
           socketPath: this.options.socketPath,
-          error: this.connectionError,
+          desktopConnected: Boolean(this.desktop?.ready),
+          desktopSocketPath: this.desktop?.socketPath ?? null,
+          error: this.connectionError || (this.desktop && !this.desktop.ready ? 'ChatGPT 桌面未连接' : null),
         });
+        return;
+      }
+
+      if (segments[1] === 'usage' && segments.length === 2 && request.method === 'GET') {
+        const force = url.searchParams.get('refresh') === '1';
+        sendJson(response, 200, await this._readUsageSnapshot(force));
         return;
       }
 
@@ -1227,7 +1415,7 @@ class Bridge {
           ok: true,
           now: Date.now(),
           version: BRIDGE_VERSION,
-          connected: Boolean(this.connection && this.connection.ready),
+          connected: this._isConnected(),
           clients: this.eventClients.size,
           daemon: { ok: false, ms: null, error: null },
         };
@@ -1352,7 +1540,9 @@ class Bridge {
         return;
       }
 
-      const connection = this._requireConnection();
+      /* Desktop operations do not depend on the separate history/data socket.
+         Only data API calls require it, at the point a request is made. */
+      const connection = { request: async (...args) => (await this._ensureDataConnection()).request(...args) };
 
       if (segments[1] === 'new-thread' && request.method === 'POST') {
         const body = await readJsonBody(request);
@@ -1530,7 +1720,7 @@ class Bridge {
           turn,
           running,
           turnId: running ? activeTurnId : null,
-          attached: this.loadedThreads.has(threadId),
+          attached: this.loadedThreads.has(threadId) || Boolean(this.desktop?.following.has(threadId)),
           modelSelection: this._modelView(threadId),
           error: liveError,
         });
@@ -1539,6 +1729,7 @@ class Bridge {
 
       if (segments[1] === 'threads' && segments.length === 3 && request.method === 'GET') {
         const threadId = segments[2];
+        this._observeDesktopThread(threadId);
         const ephemeralEntry = this.ephemeralThreads.get(threadId);
         const limit = clampItemLimit(url.searchParams.get('limit'));
         const turnLimit = clampTurnLimit(url.searchParams.get('turns'));
@@ -1568,7 +1759,7 @@ class Bridge {
         const payload = Object.assign({}, trimmedResult, {
           permission: this._permissionView(threadId),
           modelSelection: this._modelView(threadId, trimmedResult.thread),
-          attached: this.loadedThreads.has(threadId),
+          attached: this.loadedThreads.has(threadId) || Boolean(this.desktop?.following.has(threadId)),
           activeTurnId: this.activeTurns.get(threadId) || null,
           running: Boolean(this.activeTurns.get(threadId)),
           hasMore:
@@ -1610,6 +1801,11 @@ class Bridge {
 
       if (segments[1] === 'threads' && segments[3] === 'interrupt' && request.method === 'POST') {
         const threadId = segments[2];
+        if (this.desktop && !this.ephemeralThreads.has(threadId)) {
+          const result = await this._interruptDesktopThread(threadId);
+          sendJson(response, 200, result);
+          return;
+        }
         let turnId = await this._activeTurnId(threadId);
         if (!turnId) {
           /* 桌面端刚开跑，桥接还没加入这个 thread；先 attach 再找 active turn */
@@ -1661,7 +1857,7 @@ class Bridge {
 
       if (segments[1] === 'approvals' && segments[3] === 'respond' && request.method === 'POST') {
         const body = await readJsonBody(request);
-        const result = this._respondToApproval(segments[2], body);
+        const result = await this._respondToApproval(segments[2], body);
         sendJson(response, 200, result);
         return;
       }
@@ -1696,41 +1892,42 @@ class Bridge {
     return null;
   }
 
-  /* 接管：把自己加入桌面端正在用的那一个 thread。
-     实测 app-server 允许第二个连接 resume 一个正在跑的 thread，之后
-     turn/steer 和 turn/interrupt 都能直接生效——不需要把桌面端踢下线，
-     也不依赖它的窗口有没有失焦。只有会话空闲但被别的应用占着写锁时，
-     才用 archive+unarchive 把锁放掉；正在跑时绝不 archive，否则这一轮
-     会从 daemon 的索引里消失，后续中断就会变成 thread not found。 */
+  /* Explicit takeover for older app servers that can release idle ownership.
+     Sending uses the shared input queue instead: newer ChatGPT app writers
+     reject archive too, even after a turn has completed. */
   async _attachThread(threadId) {
+    if (this.desktop && !this.ephemeralThreads.has(threadId)) {
+      await this.desktop.ensureOwner(threadId);
+      const turnId = this.activeTurns.get(threadId) || this._rolloutRunningTurn(threadId) ||
+        (this.connection?.ready ? await this._activeTurnId(threadId) : null);
+      return { attached: true, desktop: true, running: Boolean(turnId), turnId };
+    }
     const connection = this._requireConnection();
     if (this.ephemeralThreads.has(threadId)) {
       const turnId = this.activeTurns.get(threadId) || null;
       return { attached: true, running: Boolean(turnId), turnId, ephemeral: true };
     }
-
     let resumeError = await this._resumeThread(threadId, {});
     if (resumeError && /active writer/i.test(resumeError.message || '')) {
       let latest = null;
       try {
         latest = await this._latestTurn(threadId);
       } catch (error) {
-        if (!isFreshThreadError(error)) throw error;
+        /* Unconfirmed state cannot authorize releasing a writer lock. */
       }
-      if (latest && latest.status === 'inProgress') {
-        const error = new Error('这个会话正在电脑上运行，暂时无法加入；请在电脑上停止这一轮后再试。');
-        error.statusCode = 409;
-        throw error;
+      const idle = latest && ['completed', 'interrupted', 'failed'].includes(latest.status);
+      if (idle && !this._rolloutRunningTurn(threadId)) {
+        this.activeTurns.delete(threadId);
+        try {
+          await connection.request('thread/archive', { threadId });
+          await connection.request('thread/unarchive', { threadId });
+        } catch (error) {
+          const wrapped = new Error('恢复空闲会话失败：' + error.message);
+          wrapped.statusCode = 409;
+          throw wrapped;
+        }
+        resumeError = await this._resumeThread(threadId, {});
       }
-      try {
-        await connection.request('thread/archive', { threadId });
-        await connection.request('thread/unarchive', { threadId });
-      } catch (error) {
-        const wrapped = new Error('释放写锁失败：' + error.message);
-        wrapped.statusCode = 409;
-        throw wrapped;
-      }
-      resumeError = await this._resumeThread(threadId, {});
     }
     if (resumeError && !isFreshThreadError(resumeError)) {
       const error = new Error('接管失败：' + resumeError.message);
@@ -1748,14 +1945,101 @@ class Bridge {
     return { attached: true, running: Boolean(turnId), turnId };
   }
 
+  async _queueInput(threadId, input) {
+    try {
+      const result = await this._requireConnection().request('thread/queue/add', {
+        threadId,
+        clientUserMessageId: crypto.randomUUID(),
+        input,
+      });
+      return { queueId: result?.queuedSubmission?.id || null, native: true };
+    } catch (error) {
+      const unsupported = error.rpcError?.code === -32601 ||
+        /unknown method|method not found|unknown variant.*thread\/queue\/add|(?:method|thread\/queue\/add).*not supported/i.test(error.message || '');
+      if (!unsupported) throw error;
+      const unavailable = new Error('当前聊天数据接口不支持消息排队。请更新 ChatGPT 和配置的后台服务后重试。');
+      unavailable.statusCode = 409;
+      throw unavailable;
+    }
+  }
+
+  async _deliverDesktopMessage(threadId, input, images, options) {
+    /* New-chat metadata may still be loaded by the data connection. Do not
+       run a turn there: ChatGPT must acquire the session and own its tools. */
+    if (this.loadedThreads.has(threadId) && !await this.releaseThreadLock(threadId, { force: true })) {
+      const error = new Error('这条聊天仍由旧的桥接任务持有，请等任务结束后在 ChatGPT 中打开。');
+      error.statusCode = 409;
+      throw error;
+    }
+    const owner = await this.desktop.ensureOwner(threadId);
+    if (options?.steer) {
+      const clientUserMessageId = crypto.randomUUID();
+      const text = input.filter(part => part.type === 'text').map(part => part.text).join('\n');
+      const result = await this.desktop.callThread(threadId, 'thread-follower-steer-turn', {
+        input, clientUserMessageId,
+        /* Native steering reads cwd/context before contacting app-server and
+           keeps this draft for its optimistic message. A null cwd inherits
+           the desktop chat's workspace without querying the data backend. */
+        restoreMessage: {
+          id: clientUserMessageId, text, cwd: null, createdAt: Date.now(),
+          context: { prompt: text, commentAttachments: [] },
+          responsesapiClientMetadata: { source: 'codex' },
+        },
+      }, owner);
+      const turnId = result?.result?.turnId || this.activeTurns.get(threadId) || null;
+      return { mode: 'steered', turnId, turn: result?.result?.turn ?? null, images, desktop: true };
+    }
+    const mode = this.permissions[threadId] || 'default';
+    const selection = this.models[threadId] || null;
+    const settings = Object.assign({}, permissionTurnParams(mode), modelTurnParams(selection));
+    if (Object.keys(settings).length) {
+      const updated = await this.desktop.callThread(threadId, 'thread-follower-update-thread-settings', {
+        threadSettings: settings,
+      }, owner);
+      if (updated?.applied !== true) throw new Error('ChatGPT 未确认模型或权限设置，本次消息尚未发送。');
+    }
+    const result = await this.desktop.callThread(threadId, 'thread-follower-start-turn', {
+      turnStart: {
+        request: Object.assign({ threadId, input, clientUserMessageId: crypto.randomUUID() },
+          permissionTurnParams(mode), modelTurnParams(selection)),
+        context: {
+          inheritThreadSettings: true,
+          useAppServerPermissionDefault: true,
+        },
+      },
+    }, owner);
+    const turn = result?.result?.turn;
+    if (!turn?.id) throw new Error('ChatGPT 未返回本次操作的确认，请刷新聊天查看结果后再重试。');
+    this.activeTurns.set(threadId, turn.id);
+    return { mode: 'started', turn, images, desktop: true };
+  }
+
+  async _interruptDesktopThread(threadId) {
+    const owner = await this.desktop.ensureOwner(threadId);
+    const turnId = this.activeTurns.get(threadId) || this._rolloutRunningTurn(threadId);
+    const result = await this.desktop.callThread(threadId, 'thread-follower-interrupt-turn', {
+      mode: 'user-stop', ...(turnId ? { expectedTurnId: turnId } : {}),
+    }, owner);
+    if (result?.ok) {
+      this.activeTurns.delete(threadId);
+      if (result.interruptedTurnId || turnId) this._markTurnStopped(threadId, result.interruptedTurnId || turnId);
+    }
+    return result;
+  }
+
   async _deliverMessage(threadId, text, imagePaths, options) {
-    const connection = this._requireConnection();
     const images = Array.isArray(imagePaths) ? imagePaths : [];
     const mode = this.permissions[threadId] || 'default';
     const selection = this.models[threadId] || null;
     const input = [];
-    if (text) input.push({ type: 'text', text });
+    /* The desktop renders this input before app-server supplies defaults.
+       Its text-element scanners require an array even for plain text. */
+    if (text) input.push({ type: 'text', text, text_elements: [] });
     for (const imagePath of images) input.push({ type: 'localImage', path: imagePath });
+    if (this.desktop && !this.ephemeralThreads.has(threadId)) {
+      return this._deliverDesktopMessage(threadId, input, images.length, options);
+    }
+    const connection = this._requireConnection();
 
     /* 「引导」：不新开一轮，把这条输入塞进正在跑的那一轮，让它立刻改按新输入走。
        前提是本地知道当前轮的 id（turn/steer 要 expectedTurnId 对得上）；这一轮刚好
@@ -1785,7 +2069,7 @@ class Bridge {
             images: images.length,
           };
         } catch (error) {
-          if (!isBusyThreadError(error) && !STEER_MISS_PATTERN.test(error.message || '')) throw error;
+          if (!isBusyThreadError(error) && !isThreadNotFoundError(error) && !STEER_MISS_PATTERN.test(error.message || '')) throw error;
           /* 这一轮可能刚被桌面端重新加载过，加入一次再试 */
           try {
             await this._attachThread(threadId);
@@ -1804,7 +2088,7 @@ class Bridge {
               };
             }
           } catch (retryError) {
-            if (!isBusyThreadError(retryError) && !STEER_MISS_PATTERN.test(retryError.message || '')) {
+            if (!isBusyThreadError(retryError) && !isThreadNotFoundError(retryError) && !STEER_MISS_PATTERN.test(retryError.message || '')) {
               throw retryError;
             }
           }
@@ -1817,12 +2101,17 @@ class Bridge {
        turn/start 再带上一次，保证当前这一轮就是用这个档位跑的。 */
     /* 临时会话没有 rollout，resume 必然报 "no rollout found"，跳过它直接开跑。 */
     const ephemeral = this.ephemeralThreads.has(threadId);
-    const resumeError = ephemeral
+    const resumeParams = Object.assign({}, permissionThreadParams(mode), modelThreadParams(selection));
+    let resumeError = ephemeral
       ? null
-      : await this._resumeThread(threadId, Object.assign({}, permissionThreadParams(mode), modelThreadParams(selection)));
-    let busyError = resumeError && !isFreshThreadError(resumeError) ? resumeError : null;
-
-    if (!busyError) {
+      : await this._resumeThread(threadId, resumeParams);
+    let busyError = null;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      if (resumeError && !isFreshThreadError(resumeError)) {
+        if (!isBusyThreadError(resumeError)) throw resumeError;
+        busyError = resumeError;
+        break;
+      }
       try {
         const result = await connection.request(
           'turn/start',
@@ -1831,8 +2120,15 @@ class Bridge {
         if (result?.turn?.id) this.activeTurns.set(threadId, result.turn.id);
         return { mode: 'started', turn: result?.turn ?? null, images: images.length };
       } catch (error) {
+        /* Another client may unload an idle thread between resume and start.
+           Retry that rejected request once; it is not evidence of a busy turn. */
+        if (!ephemeral && attempt === 0 && isThreadNotFoundError(error)) {
+          resumeError = await this._resumeThread(threadId, resumeParams);
+          continue;
+        }
         if (!isBusyThreadError(error)) throw error;
         busyError = error;
+        break;
       }
     }
 
@@ -1844,30 +2140,44 @@ class Bridge {
       throw error;
     }
 
-    if (images.length > 0) {
-      const error = new Error('这个会话正在电脑上运行，带图片的消息暂时无法排队；等它跑完再发。');
-      error.statusCode = 409;
-      throw error;
+    let idle = false;
+    try {
+      const latest = await this._latestTurn(threadId);
+      idle = Boolean(latest && ['completed', 'interrupted', 'failed'].includes(latest.status) && !this._rolloutRunningTurn(threadId));
+    } catch (error) {
+      /* Queue delivery does not need to own the thread or assume it is idle. */
     }
 
+    let queued;
     try {
-      const queued = await queueMessage({
-        binary: this.codexBinary,
-        threadId,
-        text,
-        remote: this.remoteTarget,
-        permissionArgs: permissionQueueArgs(mode),
-        model: selection && selection.model,
-        reasoningEffort: selection && selection.reasoningEffort,
-      });
-      return { mode: 'queued', queueId: queued.queueId, reason: busyError.message };
+      queued = await this._queueInput(threadId, input);
     } catch (error) {
       const wrapped = new Error(
-        `这个会话正在电脑上运行，且排队失败：${error.message}。等它跑完再发，或直接在电脑上操作。`
+        `未能确认消息投递：会话暂时无法直接写入（${busyError.message}）；队列错误：${error.message}`
       );
       wrapped.statusCode = 409;
       throw wrapped;
     }
+
+    if (idle && queued.native && queued.queueId) {
+      try {
+        /* Ownership may have been released since the initial resume. Wake an
+           idle queued turn immediately when this server can now own it. An
+           external desktop owner receives the same persisted queue entry. */
+        const wakeError = await this._resumeThread(threadId, resumeParams);
+        if (!wakeError) {
+          const result = await connection.request('thread/queue/start', {
+            threadId, queuedSubmissionId: queued.queueId,
+          });
+          if (result?.turn?.id) this.activeTurns.set(threadId, result.turn.id);
+          return { mode: 'started', turn: result?.turn ?? null, images: images.length };
+        }
+      } catch (error) {
+        /* Already accepted. Reporting failure here would encourage a duplicate
+           send if queue/start succeeded before its acknowledgement was lost. */
+      }
+    }
+    return { mode: 'queued', queueId: queued.queueId, reason: busyError.message };
   }
 
   async _resumeThread(threadId, extraParams) {
@@ -1884,7 +2194,7 @@ class Bridge {
     }
   }
 
-  _respondToApproval(requestId, body) {
+  async _respondToApproval(requestId, body) {
     const record = this.pendingApprovals.get(String(requestId));
     if (!record) {
       const error = new Error('no pending approval with that id');
@@ -1893,7 +2203,20 @@ class Bridge {
     }
 
     const result = this._buildApprovalResult(record, body);
-    this.connection.respond(Number(record.requestId), result);
+    if (record.desktop) {
+      const methods = {
+        'item/commandExecution/requestApproval': ['thread-follower-command-approval-decision', { decision: result.decision }],
+        'execCommandApproval': ['thread-follower-command-approval-decision', { decision: result.decision }],
+        'item/fileChange/requestApproval': ['thread-follower-file-approval-decision', { decision: result.decision }],
+        'applyPatchApproval': ['thread-follower-file-approval-decision', { decision: result.decision }],
+        'item/permissions/requestApproval': ['thread-follower-permissions-request-approval-response', { response: result }],
+        'item/tool/requestUserInput': ['thread-follower-submit-user-input', { response: result }],
+        'mcpServer/elicitation/request': ['thread-follower-submit-mcp-server-elicitation-response', { response: result }],
+      };
+      const target = methods[record.method];
+      if (!target) throw new Error('该请求需要在 ChatGPT 桌面 App 中处理。');
+      await this.desktop.callThread(record.threadId, target[0], { requestId: record.desktopRequestId, ...target[1] });
+    } else this.connection.respond(Number(record.requestId), result);
     this.pendingApprovals.delete(String(requestId));
     this._broadcast({ type: 'approval-resolved', requestId: String(requestId) });
     return { ok: true, response: result };
