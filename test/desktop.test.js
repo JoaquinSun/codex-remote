@@ -65,6 +65,112 @@ test('an absent owner is reported without inventing desktop ownership', async ()
   assert.equal(await pending, null);
 });
 
+test('an existing desktop owner is followed immediately without opening the chat again', async () => {
+  const { connection, sent } = ipc();
+  let opened = 0;
+  connection.openThread = async () => { opened += 1; };
+  const pending = connection.ensureOwner('chat');
+  await new Promise(setImmediate);
+  reply(connection, sent[0], { supportsUntrustedAppInput: true });
+  assert.equal((await pending).clientId, 'desktop-owner');
+  assert.equal(opened, 0);
+  assert.equal(connection.following.get('chat'), 'desktop-owner');
+  assert.equal(connection.ownerPromises.size, 0);
+});
+
+for (const absence of ['no-client-found', 'probe-timeout']) {
+  test('concurrent owner readiness shares one desktop opening after ' + absence, async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+    const { connection, sent } = ipc();
+    const opened = [];
+    connection.openThread = async id => { opened.push(id); };
+    const first = connection.ensureOwner('chat');
+    const second = connection.ensureOwner('chat');
+    assert.equal(first, second);
+    await new Promise(setImmediate);
+    assert.equal(sent.length, 1);
+    if (absence === 'probe-timeout') t.mock.timers.tick(500);
+    else reply(connection, sent[0], null, 'no-client-found');
+    await new Promise(setImmediate);
+    assert.deepEqual(opened, ['chat']);
+    t.mock.timers.tick(250);
+    await new Promise(setImmediate);
+    reply(connection, sent[1], { supportsUntrustedAppInput: true });
+    assert.equal((await first).clientId, 'desktop-owner');
+    assert.equal((await second).clientId, 'desktop-owner');
+    /* A late reply to the abandoned read-only probe cannot change ownership. */
+    reply(connection, sent[0], null, 'no-client-found');
+    assert.equal(connection.following.get('chat'), 'desktop-owner');
+    assert.equal(connection.ownerPromises.size, 0);
+    assert.equal(connection.pending.size, 0);
+    assert.equal(sent.filter(request => request.method === 'thread-owner-discovery').length, 2);
+    assert.equal(sent.filter(request => request.method === 'thread-follower-start-turn').length, 0);
+  });
+}
+
+test('owner readiness fails within its deadline when the desktop never acquires the chat', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  const { connection, sent } = ipc();
+  let opened = 0;
+  connection.openThread = async () => { opened += 1; };
+  const rejected = assert.rejects(connection.ensureOwner('chat'), error => error.statusCode === 409);
+  await new Promise(setImmediate);
+  for (let elapsed = 0; elapsed < 13000; elapsed += 250) {
+    t.mock.timers.tick(250);
+    await new Promise(setImmediate);
+  }
+  await rejected;
+  assert.equal(opened, 1);
+  assert.equal(connection.pending.size, 0);
+  assert.equal(connection.ownerPromises.size, 0);
+  assert.ok(sent.length <= 12);
+  assert.ok(sent.every(request => request.method === 'thread-owner-discovery'));
+});
+
+test('owner readiness propagates protocol errors and allows a later fresh probe', async () => {
+  const { connection, sent } = ipc();
+  let opened = 0;
+  connection.openThread = async () => { opened += 1; };
+  const failed = connection.ensureOwner('chat');
+  await new Promise(setImmediate);
+  reply(connection, sent[0], null, 'request-version-mismatch');
+  await assert.rejects(failed, /request-version-mismatch/);
+  assert.equal(opened, 0);
+  assert.equal(connection.ownerPromises.size, 0);
+  const retried = connection.ensureOwner('chat');
+  await new Promise(setImmediate);
+  reply(connection, sent[1], {});
+  assert.equal((await retried).clientId, 'desktop-owner');
+  assert.equal(opened, 0);
+});
+
+test('a disconnected owner probe rejects without opening or retrying the chat', async () => {
+  const { connection, sent } = ipc();
+  let opened = 0;
+  connection.openThread = async () => { opened += 1; };
+  const pending = connection.ensureOwner('chat');
+  await new Promise(setImmediate);
+  connection._closed(connection.socket);
+  await assert.rejects(pending, /操作结果尚未确认/);
+  assert.equal(opened, 0);
+  assert.equal(sent.length, 1);
+  assert.equal(connection.ownerPromises.size, 0);
+});
+
+test('short discovery probes do not shorten or retry follower mutation acknowledgements', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  const { connection, sent } = ipc();
+  const rejected = assert.rejects(connection.callThread('chat', 'thread-follower-start-turn', {}, {
+    clientId: 'desktop-owner',
+  }), error => error.timedOut === true);
+  t.mock.timers.tick(1000);
+  assert.equal(connection.pending.size, 1);
+  t.mock.timers.tick(19000);
+  await rejected;
+  assert.equal(sent.length, 1);
+  assert.equal(connection.pending.size, 0);
+});
+
 test('follower calls target the owning desktop window with the required protocol version', async () => {
   const { connection, sent } = ipc();
   const call = connection.callThread('chat', 'thread-follower-interrupt-turn', {
@@ -408,3 +514,71 @@ test('a failed metadata writer release stays tracked for a later cleanup attempt
   finally { console.error = original; }
   assert.equal(bridge.loadedThreads.has('chat'), true);
 });
+
+for (const status of ['notLoaded', 'notSubscribed', 'unsubscribed']) {
+  test('a confirmed ' + status + ' subscription releases metadata without archiving', async (t) => {
+    t.mock.method(console, 'log', () => {});
+    const { bridge, calls } = bridgeHarness();
+    bridge.loadedThreads.set('chat', 0);
+    bridge._latestTurn = async () => null;
+    bridge.connection.request = async (method, params) => {
+      calls.push({ method, params });
+      return { status };
+    };
+    assert.equal(await bridge.releaseThreadLock('chat', { force: true }), true);
+    assert.deepEqual(calls, [{ method: 'thread/unsubscribe', params: { threadId: 'chat' } }]);
+    assert.equal(bridge.loadedThreads.has('chat'), false);
+  });
+}
+
+test('an unconfirmed unsubscribe stays tracked and cannot trigger an archive fallback', async (t) => {
+  t.mock.method(console, 'error', () => {});
+  const failures = [
+    null,
+    new Error('connection closed before thread/unsubscribe completed'),
+    Object.assign(new Error('thread/unsubscribe timed out after 60000ms'), { timedOut: true }),
+  ];
+  for (const failure of failures) {
+    const { bridge, calls } = bridgeHarness();
+    bridge.loadedThreads.set('chat', 0);
+    bridge._latestTurn = async () => null;
+    bridge.connection.request = async (method, params) => {
+      calls.push({ method, params });
+      if (failure) throw failure;
+      return { status: 'unknown' };
+    };
+    assert.equal(await bridge.releaseThreadLock('chat', { force: true }), false);
+    assert.deepEqual(calls.map(call => call.method), ['thread/unsubscribe']);
+    assert.equal(bridge.loadedThreads.has('chat'), true);
+  }
+});
+
+test('an explicitly unsupported unsubscribe uses the legacy writer handoff', async (t) => {
+  t.mock.method(console, 'log', () => {});
+  const { bridge, calls } = bridgeHarness();
+  bridge.loadedThreads.set('chat', 0);
+  bridge._latestTurn = async () => null;
+  bridge.connection.request = async (method, params) => {
+    calls.push({ method, params });
+    if (method === 'thread/unsubscribe') {
+      throw Object.assign(new Error('method not found'), { rpcError: { code: -32601 } });
+    }
+    return {};
+  };
+  assert.equal(await bridge.releaseThreadLock('chat', { force: true }), true);
+  assert.deepEqual(calls.map(call => call.method), ['thread/unsubscribe', 'thread/archive', 'thread/unarchive']);
+  assert.equal(bridge.loadedThreads.has('chat'), false);
+});
+
+for (const running of ['cached-turn', 'latest-turn', 'rollout']) {
+  test('metadata handoff preserves a running ' + running, async () => {
+    const { bridge, calls } = bridgeHarness();
+    bridge.loadedThreads.set('chat', 0);
+    bridge._latestTurn = async () => running === 'latest-turn' ? { id: 'running-turn', status: 'inProgress' } : null;
+    if (running === 'cached-turn') bridge.activeTurns.set('chat', 'running-turn');
+    if (running === 'rollout') bridge.rollout.states.set('chat', { running: true, turnId: 'running-turn' });
+    assert.equal(await bridge.releaseThreadLock('chat', { force: true }), false);
+    assert.equal(bridge.loadedThreads.has('chat'), true);
+    assert.deepEqual(calls, []);
+  });
+}

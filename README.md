@@ -39,6 +39,8 @@ Build it locally with `bash scripts/build-macos.sh`; outputs go into `macos/buil
 For persistent conversations, **sending, steering, interruption, and approvals run inside Codex in the ChatGPT desktop app**.
 The bridge discovers the owning desktop window through `~/.codex/ipc/ipc.sock` and uses its follower protocol.
 The desktop keeps the writer lock. When a conversation has no desktop owner, the bridge opens it in ChatGPT through a system link.
+An already open chat is used immediately; other chats use a short ownership probe before opening,
+so delivery does not wait for the desktop router's full missing-owner timeout. Concurrent requests for the same chat share this readiness check.
 
 ```
 phone browser ──HTTP/SSE──▶ bridge ──desktop IPC──▶ Codex in ChatGPT
@@ -47,8 +49,10 @@ phone browser ──HTTP/SSE──▶ bridge ──desktop IPC──▶ Codex in
 
 - When ChatGPT is connected and the default data socket is missing or refuses connections, the bridge uses ChatGPT's bundled Codex to run `app-server daemon start`. This restores the shared local data service; persistent chat execution stays in the desktop app.
 - The default data socket is `$CODEX_HOME/app-server-control/app-server-control.sock`, with `CODEX_HOME` defaulting to `~/.codex`. An explicit `--socket` disables automatic daemon startup; `--no-auto-start-daemon` also disables it.
-  Its server can be a different process from ChatGPT's embedded backend. New conversations are created there as metadata,
-  then release their writer before the desktop runs the first turn.
+  Its server can be a different process from ChatGPT's embedded backend. Persistent new conversations use paginated metadata,
+  save their name (defaulting to “新对话” when left blank), then unsubscribe before the desktop runs the first turn.
+  Saving the name indexes an empty chat without starting a model turn, so it survives this handoff and server restarts;
+  their history stays empty until the first user message. A failed or unconfirmed handoff remains tracked, and uncertain sends are never resubmitted.
 - Desktop IPC is an internal protocol verified with ChatGPT 26.1111.21308 (state protocol 13), while retaining state protocol 11 support. Unverified protocol versions fail explicitly.
   Temporary conversations have no persisted record for the desktop to resume and continue using the data service's in-memory sessions.
 - The bridge has zero dependencies (Node built-in modules only); the WebSocket-over-Unix-socket client is hand-written.

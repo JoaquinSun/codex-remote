@@ -241,15 +241,154 @@ test('new chat applies the chosen model before the first turn and saves it for l
     bridge.calls.push({ method, params });
     if (method === 'model/list') return { data: MODELS, nextCursor: null };
     if (method === 'thread/start') return { thread: { id: 'new-chat', cwd: params.cwd, model: params.model }, model: params.model, reasoningEffort: params.config.model_reasoning_effort };
+    if (method === 'thread/name/set') return {};
     throw new Error('unexpected method: ' + method);
   };
   const result = await api(bridge, '/api/new-thread', { cwd: directory, model: 'example-deep', reasoningEffort: 'high' });
   assert.equal(result.status, 200);
   const created = bridge.calls.find(call => call.method === 'thread/start');
   assert.equal(created.params.model, 'example-deep');
+  assert.equal(created.params.historyMode, 'paginated');
   assert.equal(created.params.config.model_reasoning_effort, 'high');
   assert.equal(loadModelMap(bridge.options.modelFile)['new-chat'].model, 'example-deep');
   assert.equal(bridge._modelView('new-chat').effective.reasoningEffort, 'high');
+});
+
+test('a persistent chat with no supplied name survives handoff and a new data connection', async (t) => {
+  t.mock.method(console, 'log', () => {});
+  const { bridge, directory } = harness(t);
+  const thread = { id: 'empty-chat', cwd: directory, name: null };
+  let indexed;
+  let subscribed = true;
+  bridge.connection.request = async (method, params) => {
+    bridge.calls.push({ method, params });
+    if (method === 'thread/start') {
+      assert.equal(params.historyMode, 'paginated');
+      return { thread };
+    }
+    if (method === 'thread/turns/list') {
+      if (!indexed) throw new Error('thread empty-chat is not materialized yet; thread/turns/list is unavailable before first user message');
+      return { data: [] };
+    }
+    if (method === 'thread/name/set') {
+      indexed = Object.assign({}, thread, { name: params.name });
+      return {};
+    }
+    if (method === 'thread/unsubscribe') {
+      subscribed = false;
+      return { status: 'unsubscribed' };
+    }
+    if (method === 'thread/read') {
+      assert.equal(subscribed, false);
+      if (!indexed) throw new Error('thread not loaded: empty-chat');
+      return { thread: indexed };
+    }
+    throw new Error('unexpected method: ' + method);
+  };
+  const created = await api(bridge, '/api/new-thread', { cwd: directory });
+  assert.equal(created.status, 200);
+  assert.equal(created.body.thread.id, 'empty-chat');
+  assert.equal(created.body.thread.name, '新对话');
+  assert.equal(bridge.loadedThreads.has('empty-chat'), false);
+  assert.deepEqual(bridge.calls.map(call => call.method), ['thread/start', 'thread/name/set', 'thread/turns/list', 'thread/unsubscribe']);
+  /* A restarted bridge has no loaded-thread or settings cache to fall back on. */
+  const { bridge: restarted } = harness(t);
+  restarted.connection.request = bridge.connection.request;
+  const opened = await api(restarted, '/api/threads/empty-chat');
+  assert.equal(opened.status, 200);
+  assert.equal(opened.body.thread.cwd, directory);
+  assert.deepEqual(opened.body.thread.turns, []);
+  assert.equal(opened.body.hasMore, false);
+  assert.equal(opened.body.running, false);
+  for (const suffix of ['', '?light=1']) {
+    const live = await api(restarted, '/api/threads/empty-chat/live' + suffix);
+    assert.equal(live.status, 200);
+    assert.equal(live.body.turn, null);
+    assert.equal(live.body.error, null);
+    assert.equal(live.body.running, false);
+  }
+});
+
+test('unmaterialized paginated metadata opens with empty history and no live error', async (t) => {
+  const { bridge } = harness(t);
+  bridge.connection.request = async (method) => {
+    if (method === 'thread/read') return { thread: { id: 'empty-chat', cwd: '/tmp', name: null } };
+    throw new Error('thread empty-chat is not materialized yet; thread/turns/list is unavailable before first user message');
+  };
+  const opened = await api(bridge, '/api/threads/empty-chat');
+  assert.equal(opened.status, 200);
+  assert.deepEqual(opened.body.thread.turns, []);
+  assert.equal(opened.body.hasMore, false);
+  const live = await api(bridge, '/api/threads/empty-chat/live');
+  assert.equal(live.status, 200);
+  assert.equal(live.body.turn, null);
+  assert.equal(live.body.error, null);
+});
+
+test('an unconfirmed persistent name cannot report creation success or release its writer', async (t) => {
+  const { bridge, directory } = harness(t);
+  bridge.connection.request = async (method, params) => {
+    bridge.calls.push({ method, params });
+    if (method === 'thread/start') return { thread: { id: 'empty-chat', cwd: directory } };
+    throw Object.assign(new Error('thread/name/set timed out after 60000ms'), { timedOut: true });
+  };
+  const created = await api(bridge, '/api/new-thread', { cwd: directory });
+  assert.equal(created.status, 502);
+  assert.match(created.body.error, /建档未确认/);
+  assert.equal(bridge.loadedThreads.has('empty-chat'), true);
+  assert.deepEqual(bridge.calls.map(call => call.method), ['thread/start', 'thread/name/set']);
+});
+
+test('new ephemeral chats retain their in-memory history and subscription', async (t) => {
+  const { bridge, directory } = harness(t);
+  bridge.connection.request = async (method, params) => {
+    bridge.calls.push({ method, params });
+    if (method === 'thread/start') return { thread: { id: 'temporary', cwd: params.cwd } };
+    throw new Error('unexpected method: ' + method);
+  };
+  assert.equal((await api(bridge, '/api/new-thread', { cwd: directory, ephemeral: true })).status, 200);
+  assert.deepEqual(bridge.calls.map(call => call.method), ['thread/start']);
+  assert.equal(bridge.calls[0].params.ephemeral, true);
+  assert.equal(bridge.calls[0].params.historyMode, undefined);
+  assert.equal(bridge.ephemeralThreads.has('temporary'), true);
+  assert.equal(bridge.loadedThreads.has('temporary'), true);
+});
+
+test('empty-history handling preserves real missing-thread and history-service errors', async (t) => {
+  for (const failure of ['thread not loaded: missing', 'history service unavailable']) {
+    const { bridge } = harness(t);
+    bridge.connection.request = async (method) => {
+      if (method === 'thread/read' && failure === 'history service unavailable') return { thread: { id: 'missing' } };
+      throw new Error(failure);
+    };
+    const read = await api(bridge, '/api/threads/missing');
+    assert.equal(read.status, 500);
+    assert.equal(read.body.error, failure);
+    await assert.rejects(bridge._latestTurn('missing'), error => error.message === failure);
+  }
+});
+
+test('an empty-history error cannot invent metadata when thread/read itself fails', async (t) => {
+  const { bridge } = harness(t);
+  const failure = new Error('thread missing is not materialized yet; thread/turns/list is unavailable before first user message');
+  bridge.connection.request = async () => { throw failure; };
+  await assert.rejects(bridge._readThreadWindow('missing', 10), error => error === failure);
+});
+
+test('legacy history reads still work when pagination is explicitly unsupported', async (t) => {
+  const { bridge } = harness(t);
+  const turn = { id: 'old-turn', status: 'completed', items: [] };
+  bridge.connection.request = async (method, params) => {
+    bridge.calls.push({ method, params });
+    if (method === 'thread/turns/list') throw new Error('method not found');
+    if (method === 'thread/read') return { thread: { id: 'legacy', turns: params.includeTurns ? [turn] : [] } };
+    throw new Error('unexpected method: ' + method);
+  };
+  const result = await bridge._readThreadWindow('legacy', 10);
+  assert.equal(result.windowed, false);
+  assert.deepEqual(result.thread.turns, [turn]);
+  assert.equal(result.thread.hasMoreTurns, false);
+  assert.deepEqual(bridge.calls.map(call => call.method), ['thread/read', 'thread/turns/list', 'thread/read']);
 });
 
 test('invalid model or effort returns 400 and cannot replace the saved choice', async (t) => {

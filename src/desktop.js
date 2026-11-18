@@ -118,6 +118,7 @@ class DesktopConnection extends EventEmitter {
     this.pending = new Map();
     this.following = new Map();
     this.states = new Map();
+    this.ownerPromises = new Map();
     this.connecting = null;
     this.buffer = Buffer.alloc(0);
   }
@@ -285,25 +286,49 @@ class DesktopConnection extends EventEmitter {
     });
   }
 
-  async findOwner(threadId) {
+  async findOwner(threadId, options = {}) {
     await this.connect();
     try {
-      return await this.request('thread-owner-discovery', { hostId: 'local', conversationId: threadId }, { timeoutMs: 12000 });
+      return await this.request('thread-owner-discovery', { hostId: 'local', conversationId: threadId }, {
+        timeoutMs: options.timeoutMs ?? 12000,
+      });
     } catch (error) {
       if (error.desktopError === 'no-client-found') return null;
       throw error;
     }
   }
 
-  async ensureOwner(threadId) {
-    let owner = await this.findOwner(threadId);
+  ensureOwner(threadId) {
+    if (this.ownerPromises.has(threadId)) return this.ownerPromises.get(threadId);
+    const pending = this._ensureOwner(threadId).finally(() => {
+      if (this.ownerPromises.get(threadId) === pending) this.ownerPromises.delete(threadId);
+    });
+    this.ownerPromises.set(threadId, pending);
+    return pending;
+  }
+
+  async _ensureOwner(threadId) {
+    /* A missing-owner discovery waits ten seconds in the desktop router.
+       Only this read-only probe may time out and be repeated; follower
+       mutations must keep their original acknowledgement and never retry. */
+    const probe = async timeoutMs => {
+      try {
+        return await this.findOwner(threadId, { timeoutMs });
+      } catch (error) {
+        if (error.timedOut) return null;
+        throw error;
+      }
+    };
+    let owner = await probe(500);
     if (!owner) {
       await this.openThread(threadId);
       const deadline = Date.now() + 12000;
-      do {
-        await new Promise(resolve => setTimeout(resolve, 250));
-        owner = await this.findOwner(threadId);
-      } while (!owner && Date.now() < deadline);
+      while (!owner && Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, Math.min(250, deadline - Date.now())));
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) break;
+        owner = await probe(Math.min(1000, remaining));
+      }
     }
     if (!owner) {
       const error = new Error('ChatGPT 尚未接入这条聊天。请在桌面 App 中打开它；旧版桥接正在运行的任务需要先完成。');

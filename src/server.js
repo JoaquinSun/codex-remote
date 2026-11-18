@@ -51,7 +51,7 @@ const MODEL_CATALOG_TTL_MS = 60000;
 /* turn/steer 的 expectedTurnId 对不上（这一轮刚好跑完、或者已经换轮了）时的报错都长这样；
    这些情况下引导没意义，退回正常发送即可。 */
 const STEER_MISS_PATTERN = /expectedturnid|expected turn|no active turn|not active|turn not found|already (?:finished|completed)/i;
-const BRIDGE_VERSION = '1.12.3';
+const BRIDGE_VERSION = '1.12.4';
 /* 延时探测别被 Codex 的忙闲拖住：HTTP 最多等 350ms，超了先用上一次采样；
    采样 1.5 秒内算新鲜，不必重复问 daemon。 */
 const DAEMON_PROBE_DEADLINE_MS = 350;
@@ -77,6 +77,10 @@ const SLIM_ANY_STRING = 40000;
 /* 默认只给手机最近这么多条记录，更早的靠前端「显示更早的」按需再拉。 */
 const THREAD_ITEM_LIMIT = 500;
 const THREAD_ITEM_LIMIT_MAX = 20000;
+
+function isUnmaterializedHistoryError(error) {
+  return /is not materialized yet;\s*thread\/turns\/list is unavailable before first user message\b/i.test(error?.message || '');
+}
 
 function clipForPhone(text, limit) {
   const value = String(text === undefined || text === null ? '' : text);
@@ -1074,8 +1078,7 @@ class Bridge {
 
   async releaseThreadLock(threadId, options = {}) {
     if (!threadId || !this.loadedThreads.has(threadId)) return false;
-    /* 临时会话不写盘，archive/unarchive 那套放锁手法对它没有意义，
-       而且它是桥接自己独占的，不需要把写锁让给桌面端。 */
+    /* 临时会话不写盘，由桥接独占，不需要把写锁让给桌面端。 */
     if (this.ephemeralThreads.has(threadId)) return false;
     if (this.activeTurns.has(threadId)) return false;
     /* Never yank the lock out from under an in-flight resume/turn-start pair. */
@@ -1085,7 +1088,7 @@ class Bridge {
     if (!this.connection || !this.connection.ready) return false;
 
     /* 放锁前再跟 daemon 对一次最新一轮。桥接没收到桌面端那一轮的 turn 通知，
-       只看本地缓存就可能把正在跑的会话 archive 掉——之后 turn/interrupt 会报
+       只看本地缓存就可能把正在跑的会话卸载——之后 turn/interrupt 会报
        "thread not found"，表现就是手机上一直中断不了。 */
     let latest;
     try {
@@ -1103,8 +1106,20 @@ class Bridge {
     }
 
     try {
-      await this.connection.request('thread/archive', { threadId });
-      await this.connection.request('thread/unarchive', { threadId });
+      try {
+        const result = await this.connection.request('thread/unsubscribe', { threadId });
+        if (!['notLoaded', 'notSubscribed', 'unsubscribed'].includes(result?.status)) {
+          throw new Error('ChatGPT 未确认取消聊天订阅。');
+        }
+      } catch (error) {
+        /* Older data servers need the legacy handoff. An uncertain result
+           must stay tracked, never trigger another mutation as a fallback. */
+        const unsupported = error.rpcError?.code === -32601 ||
+          /unknown method|method not found|unknown variant.*thread\/unsubscribe/i.test(error.message || '');
+        if (error.timedOut || !unsupported) throw error;
+        await this.connection.request('thread/archive', { threadId });
+        await this.connection.request('thread/unarchive', { threadId });
+      }
       this.loadedThreads.delete(threadId);
       console.log(`released writer lock for ${threadId}`);
       return true;
@@ -1286,8 +1301,9 @@ class Bridge {
      （实测 4–9 秒），而 thread/turns/list 取最近 10 轮只要 8ms。这里按「最近 N 轮」
      开窗，元数据单独读（4ms），再用 nextCursor 判断后面还有没有。 */
   async _readThreadWindow(threadId, turnLimit) {
+    let meta;
     try {
-      const meta = await this.connection.request('thread/read', { threadId });
+      meta = await this.connection.request('thread/read', { threadId });
       this._recordThreadSettings(threadId, meta);
       const list = await this.connection.request('thread/turns/list', {
         threadId,
@@ -1305,6 +1321,15 @@ class Bridge {
         windowed: true,
       };
     } catch (error) {
+      /* Paginated metadata is already persistent, but the first turn does
+         not exist until the first user message. Keep the verified metadata
+         and show an empty history without hiding genuine missing threads. */
+      if (meta?.thread && isUnmaterializedHistoryError(error)) {
+        return {
+          thread: Object.assign({}, meta.thread, { turns: [], hasMoreTurns: false }),
+          windowed: true,
+        };
+      }
       const message = error && error.message ? error.message : '';
       if (!/not supported|do not support|unknown method|method not found|no rollout found/i.test(message)) {
         throw error;
@@ -1340,7 +1365,7 @@ class Bridge {
       return latest || null;
     } catch (error) {
       const message = error && error.message ? error.message : '';
-      if (/no rollout found/i.test(message)) return null;
+      if (/no rollout found/i.test(message) || isUnmaterializedHistoryError(error)) return null;
       if (!/not supported|unknown method|method not found/i.test(message)) throw error;
       const read = await this._readThread(threadId);
       const turns = read?.thread?.turns ?? [];
@@ -1566,7 +1591,8 @@ class Bridge {
         }
         const created = await connection.request(
           'thread/start',
-          Object.assign({ cwd }, ephemeral ? { ephemeral: true } : {}, permissionThreadParams(mode), modelThreadParams(selection))
+          Object.assign({ cwd }, ephemeral ? { ephemeral: true } : { historyMode: 'paginated' },
+            permissionThreadParams(mode), modelThreadParams(selection))
         );
         const threadId = created?.thread?.id;
         this._markThreadLoaded(threadId);
@@ -1579,18 +1605,27 @@ class Bridge {
         if (mode !== 'default') this._setPermission(threadId, mode);
         this._recordThreadSettings(threadId, created);
         if (selection.model) this._setModel(threadId, selection);
-        if (name) {
+        /* The daemon drops an unmaterialized empty chat when its creating
+           connection closes. Saving a name indexes it without starting a
+           model turn, including when the user leaves the name field blank. */
+        const savedName = name || (ephemeral ? '' : '新对话');
+        if (savedName) {
           try {
-            await connection.request('thread/name/set', { threadId, name });
+            await connection.request('thread/name/set', { threadId, name: savedName });
           } catch (error) {
-            /* naming is best-effort */
+            if (!ephemeral) {
+              const failure = new Error(`新对话建档未确认：${error.message}。请刷新列表查看创建结果。`, { cause: error });
+              failure.statusCode = 502;
+              throw failure;
+            }
+            /* Temporary names are best-effort; their metadata stays in memory. */
           }
         }
         /* Nothing is running in a brand new chat, so the writer lock can go
            back right away and the desktop app can open it immediately.
            临时会话桌面端看不到，写锁自己留着。 */
         if (!ephemeral) await this.releaseThreadLock(threadId, { force: true });
-        sendJson(response, 200, { thread: Object.assign({}, created.thread, name ? { name } : {}) });
+        sendJson(response, 200, { thread: Object.assign({}, created.thread, savedName ? { name: savedName } : {}) });
         return;
       }
 
